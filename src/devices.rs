@@ -1,8 +1,9 @@
 //! Sound card enumeration and lookup.
 //!
 //! The device reports what it has and the server decides which one to use; nothing here chooses. The
-//! reported `id` is a cpal device id -- on Linux the ALSA name, e.g. `hw:CARD=DAC,DEV=0` -- because
-//! it has to survive a round trip through the server's config and still resolve months later.
+//! reported `id` is a cpal device id -- the host prefix followed by the platform name, so on Linux
+//! `alsa:hw:CARD=DAC,DEV=0` -- because it has to survive a round trip through the server's config
+//! and still resolve months later. Treat it as opaque: it is cpal's spelling, not ALSA's.
 //!
 //! Everything a device says about itself is best-effort. A card that refuses to enumerate its
 //! configs is skipped rather than reported as broken; nothing here may fail the whole listing.

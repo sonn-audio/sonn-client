@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 /// One audio output this device can play through, as offered to the server for selection.
 ///
 /// `id` is what comes back in `DesiredPlayer::output`, so it has to be something we can resolve
-/// again later: the cpal device id (on Linux the ALSA name, e.g. `hw:CARD=DAC,DEV=0`). `name` is
-/// only ever shown to a human.
+/// again later: the cpal device id, which on Linux reads as `alsa:hw:CARD=DAC,DEV=0` -- cpal's host
+/// prefix in front of the ALSA name. `name` is only ever shown to a human.
 // `Hash` so the status loop can tell whether the card list changed without diffing it by hand.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct OutputDeviceInfo {

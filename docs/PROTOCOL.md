@@ -53,7 +53,7 @@ replies with the desired state.
   "arch": "aarch64",
   "outputs": [
     {
-      "id": "hw:CARD=DAC,DEV=0",
+      "id": "alsa:hw:CARD=DAC,DEV=0",
       "name": "Topping E30 Analogue Stereo",
       "channels": 2,
       "sample_rates": [44100, 192000],
@@ -69,7 +69,7 @@ replies with the desired state.
   ],
   "inputs": [
     {
-      "id": "hw:CARD=CODEC,DEV=0",
+      "id": "alsa:hw:CARD=CODEC,DEV=0",
       "name": "USB Audio CODEC",
       "channels": 2,
       "sample_rates": [44100, 48000],
@@ -113,7 +113,7 @@ reach back in.
     {
       "client_id": "sonn-kitchen-pi-9e2f41a7",
       "state": "streaming",
-      "output": "hw:CARD=DAC,DEV=0",
+      "output": "alsa:hw:CARD=DAC,DEV=0",
       "codec": "flac",
       "sample_rate": 44100,
       "bit_depth": 16,
@@ -130,7 +130,7 @@ reach back in.
     {
       "client_id": "sonn-kitchen-pi-9e2f41a7-linein",
       "state": "streaming",
-      "input": "hw:CARD=CODEC,DEV=0",
+      "input": "alsa:hw:CARD=CODEC,DEV=0",
       "codec": "pcm",
       "sample_rate": 48000,
       "bit_depth": 16,
@@ -171,7 +171,7 @@ broken.
     {
       "client_id": "sonn-kitchen-pi-9e2f41a7",
       "name": "Kitchen",
-      "output": "hw:CARD=DAC,DEV=0",
+      "output": "alsa:hw:CARD=DAC,DEV=0",
       "enabled": true,
       "codecs": ["flac", "pcm"],
       "sample_rate": null,
@@ -189,7 +189,7 @@ broken.
     {
       "client_id": "sonn-kitchen-pi-9e2f41a7-linein",
       "name": "BeoSound 9000",
-      "input": "hw:CARD=CODEC,DEV=0",
+      "input": "alsa:hw:CARD=CODEC,DEV=0",
       "enabled": true,
       "sample_rate": 48000,
       "bit_depth": 16,
