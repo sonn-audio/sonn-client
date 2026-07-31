@@ -54,9 +54,10 @@ const FEATURES: [&str; 3] = ["source", "beoremote", "components"];
 async fn main() -> Result<()> {
     let (command, argument, log_level) = parse_args()?;
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(
-            log_level.unwrap_or_else(|| "off".to_string()),
-        ))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(default_log_filter(
+            command.as_deref(),
+            log_level,
+        )))
         .init();
 
     match command.as_deref() {
@@ -445,7 +446,8 @@ fn print_usage() {
     eprintln!("  sonn-client --help");
     eprintln!("  sonn-client --version");
     eprintln!();
-    eprintln!("Log levels: off (default), error, warn, info, debug, trace");
+    eprintln!("Log levels: error, warn, info, debug, trace. The service logs at info unless told");
+    eprintln!("otherwise (--log-level, or RUST_LOG); the one-shot commands stay quiet.");
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  sudo sonn-client install         # write the systemd unit and start the service");
@@ -454,6 +456,30 @@ fn print_usage() {
     );
     eprintln!("  sonn-client --log-level info run # run in the foreground with logs");
     eprintln!("  sudo sonn-client pair-remote     # pair a Beoremote One without a terminal dance");
+}
+
+/// What to log when nobody said.
+///
+/// The service is the whole point of this program and it runs unattended, so it logs at `info` by
+/// default: a device that fails to find its server has to say so in `journalctl`, and silence is the
+/// one thing that cannot be diagnosed remotely. The one-shot commands print their own output and stay
+/// quiet. `--log-level` wins over everything; `RUST_LOG` is honoured in between so the usual Rust
+/// habit works on a device with no way to edit the unit file.
+fn default_log_filter(command: Option<&str>, requested: Option<String>) -> String {
+    if let Some(level) = requested {
+        return level;
+    }
+    if let Ok(env) = std::env::var("RUST_LOG") {
+        if !env.trim().is_empty() {
+            return env;
+        }
+    }
+    match command {
+        // Crate-scoped: at plain `info` the HTTP and mDNS crates fill the journal with traffic
+        // nobody asked about.
+        Some("run") | Some("install") | None => "sonn_client=info".to_string(),
+        _ => "off".to_string(),
+    }
 }
 
 fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
@@ -482,4 +508,28 @@ fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
     }
 
     Ok((command, argument, log_level))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_service_logs_and_the_one_shot_commands_do_not() {
+        // A device nobody is watching has to leave a trail; `devices` and `components` print their
+        // answer and would only be cluttered by one.
+        assert_eq!(default_log_filter(Some("run"), None), "sonn_client=info");
+        assert_eq!(default_log_filter(None, None), "sonn_client=info");
+        assert_eq!(default_log_filter(Some("devices"), None), "off");
+
+        assert_eq!(
+            default_log_filter(Some("run"), Some("debug".to_string())),
+            "debug",
+            "an explicit --log-level wins"
+        );
+        assert_eq!(
+            default_log_filter(Some("devices"), Some("trace".to_string())),
+            "trace"
+        );
+    }
 }
