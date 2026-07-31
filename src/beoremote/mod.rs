@@ -78,7 +78,10 @@ impl BeoremoteConfig {
                 .clone()
                 .unwrap_or_else(|| fallback_base_url.to_string()),
             menu_poll: Duration::from_millis(
-                desired.menu_poll_ms.unwrap_or(DEFAULT_MENU_POLL_MS).max(2000),
+                desired
+                    .menu_poll_ms
+                    .unwrap_or(DEFAULT_MENU_POLL_MS)
+                    .max(2000),
             ),
             volume_player: desired.volume_player.clone(),
             volume_step: desired.volume_step.unwrap_or(DEFAULT_VOLUME_STEP).max(1),
@@ -255,7 +258,10 @@ async fn publish(socket: &mut UnixStream, api: &BeoremoteApi) -> Result<Publishe
         Err(err) => {
             // An empty menu is a better failure than none: the remote renders "no sources" instead
             // of hanging on three dots, and the next poll fills it in.
-            warn!("beoremote menu unavailable ({:#}); publishing an empty menu", err);
+            warn!(
+                "beoremote menu unavailable ({:#}); publishing an empty menu",
+                err
+            );
             Menu {
                 revision: None,
                 sources: Vec::new(),
@@ -367,7 +373,10 @@ async fn handle_write(
                 .map(|(name, _)| name.as_str())
                 .unwrap_or("?");
             info!("beoremote picked source {} ({})", index, label);
-            match api.select("source", raw, published.revision.as_deref()).await {
+            match api
+                .select("source", raw, published.revision.as_deref())
+                .await
+            {
                 SelectOutcome::Started { name } => {
                     debug!("server started {:?}", name);
                     false
@@ -439,8 +448,7 @@ fn spawn_hid_listener(
     hid_connected: Arc<AtomicBool>,
 ) -> Result<()> {
     remove_stale_socket(&path)?;
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind {}", path.display()))?;
+    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
     // bluetoothd runs as root; the socket has to be writable by it regardless of who we are.
     set_socket_permissions(&path)?;
     info!("beoremote listening on {} for HID reports", path.display());

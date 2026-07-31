@@ -275,11 +275,7 @@ impl Registry {
             .into_iter()
             .map(|report| report.state)
             .collect();
-        states.extend(
-            self.source_reports()
-                .into_iter()
-                .map(|report| report.state),
-        );
+        states.extend(self.source_reports().into_iter().map(|report| report.state));
         if states.is_empty() {
             return STATE_IDLE.to_string();
         }

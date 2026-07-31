@@ -119,20 +119,15 @@ Release builds for all four Linux targets are cross-compiled in CI (`cross build
 | `armv7-unknown-linux-gnueabihf` | Pi 3 / 2 on a 32-bit OS       |
 | `arm-unknown-linux-gnueabihf`   | Pi 1 / Zero                   |
 
-### First build
+### Building against the fork
 
-This repo is written against `sendspin` 0.3.x plus our `source@v1` patch, and against `cpal` 0.18 —
-both pre-1.0. The first build is the one that confirms the shapes they expose. The places that touch
-them:
+`source@v1` is not in the published crate, so the dependency points at our fork's branch. Until that
+branch is pushed, build against a checkout next door — `sendspin-rs` beside this repo, on
+`feat/source-v1` — by uncommenting the `[patch]` block at the bottom of `Cargo.toml`.
 
-- `src/player.rs` — `PlayerV1Support`, `PlayerState`, `PlayerCommand`, `AudioFormatSpec`, `SyncedPlayer`
-- `src/source.rs` — `SourceV1Support`, `SourceState`, `InputStreamSource`, `build_input_stream`
-- `src/devices.rs` — `DeviceTrait::id` / `description` / `supports_input`, and `SampleRate` (a plain
-  `u32` alias in cpal 0.18, not a newtype)
-
-Width-sensitive fields go through `try_into()` on purpose, so a minor bump does not break the build.
-The whole thing has been written but not yet compiled on a machine with a Rust toolchain: expect the
-first `cargo build` to be where any of the above needs a nudge.
+Verified with cargo 1.97: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are
+clean and `cargo test` passes (35). What that does *not* cover is a real device: no player, source,
+remote bridge or component install has been run against hardware yet.
 
 ## Line-in over Sendspin
 

@@ -111,11 +111,7 @@ async fn run() -> Result<()> {
     // rebooted, renamed or moved to another address needs no help from anyone here.
     loop {
         let server = resolve_server(&config).await;
-        let api = ServerApi::new(
-            &server.base_url,
-            &server.register_path,
-            &server.status_path,
-        )?;
+        let api = ServerApi::new(&server.base_url, &server.register_path, &server.status_path)?;
         info!("attaching to {}", api.base_url());
 
         let outputs = devices::list_output_devices().unwrap_or_else(|err| {
@@ -388,14 +384,14 @@ fn hash_outputs(outputs: &[OutputDeviceInfo]) -> u64 {
 /// device that switched an amplifier on when it joined switches it off again when it leaves.
 fn spawn_shutdown_handler(hooks: Arc<hooks::HookRunner>) {
     tokio::spawn(async move {
-        let mut term = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        {
-            Ok(signal) => signal,
-            Err(err) => {
-                warn!("cannot listen for SIGTERM: {}", err);
-                return;
-            }
-        };
+        let mut term =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(signal) => signal,
+                Err(err) => {
+                    warn!("cannot listen for SIGTERM: {}", err);
+                    return;
+                }
+            };
         tokio::select! {
             _ = term.recv() => info!("SIGTERM received"),
             result = tokio::signal::ctrl_c() => {
@@ -453,7 +449,9 @@ fn print_usage() {
     eprintln!();
     eprintln!("Examples:");
     eprintln!("  sudo sonn-client install         # write the systemd unit and start the service");
-    eprintln!("  sonn-client devices              # list the sound cards the server will be offered");
+    eprintln!(
+        "  sonn-client devices              # list the sound cards the server will be offered"
+    );
     eprintln!("  sonn-client --log-level info run # run in the foreground with logs");
     eprintln!("  sudo sonn-client pair-remote     # pair a Beoremote One without a terminal dance");
 }

@@ -13,12 +13,8 @@ pub async fn run_install() -> Result<()> {
     println!("Device id: {}", config.device_id);
     println!("Config:    {}", config_path.display());
 
-    fs::write(SYSTEMD_UNIT_PATH, systemd_unit()).with_context(|| {
-        format!(
-            "write {} (run as root, or use sudo)",
-            SYSTEMD_UNIT_PATH
-        )
-    })?;
+    fs::write(SYSTEMD_UNIT_PATH, systemd_unit())
+        .with_context(|| format!("write {} (run as root, or use sudo)", SYSTEMD_UNIT_PATH))?;
     println!("Unit:      {}", SYSTEMD_UNIT_PATH);
 
     run_systemctl(&["daemon-reload"])?;

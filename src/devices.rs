@@ -131,7 +131,11 @@ pub fn list_input_devices() -> Result<Vec<OutputDeviceInfo>> {
         }
     }
 
-    results.sort_by(|a, b| b.is_default.cmp(&a.is_default).then_with(|| a.id.cmp(&b.id)));
+    results.sort_by(|a, b| {
+        b.is_default
+            .cmp(&a.is_default)
+            .then_with(|| a.id.cmp(&b.id))
+    });
     Ok(results)
 }
 

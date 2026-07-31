@@ -72,8 +72,6 @@ struct SelectResponse {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
-    revision: Option<String>,
-    #[serde(default)]
     error: Option<String>,
 }
 
@@ -134,7 +132,13 @@ impl BeoremoteApi {
             "active_source": active_source,
             "revision": revision,
         });
-        let response = match self.client.post(self.url("select")).json(&body).send().await {
+        let response = match self
+            .client
+            .post(self.url("select"))
+            .json(&body)
+            .send()
+            .await
+        {
             Ok(response) => response,
             Err(err) => {
                 return SelectOutcome::Failed {
@@ -151,7 +155,9 @@ impl BeoremoteApi {
             };
         }
         if status.as_u16() == 409 {
-            // Stale revision. The current one comes back in the body, so a re-read is one call.
+            // Stale revision: the list moved since we rendered it. The body carries the current
+            // revision, but re-reading the menu brings a fresh one anyway -- and we need the entries
+            // regardless, so there is nothing to save by reading it here.
             return SelectOutcome::Refresh;
         }
         let error = parsed.and_then(|body| body.error).unwrap_or_default();

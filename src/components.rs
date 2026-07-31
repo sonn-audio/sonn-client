@@ -152,10 +152,12 @@ async fn install_bluetoothd(component: &DesiredComponent) -> Result<ComponentSta
         .url
         .as_deref()
         .ok_or_else(|| anyhow!("no url for {}", component.name))?;
-    let expected = component
-        .sha256
-        .as_deref()
-        .ok_or_else(|| anyhow!("no sha256 for {}; refusing to install an unverified daemon"))?;
+    let expected = component.sha256.as_deref().ok_or_else(|| {
+        anyhow!(
+            "no sha256 for {}; refusing to install an unverified daemon",
+            component.name
+        )
+    })?;
 
     info!("fetching {} from {}", component.name, url);
     let bytes = reqwest::get(url)
@@ -181,8 +183,16 @@ async fn install_bluetoothd(component: &DesiredComponent) -> Result<ComponentSta
     fs::create_dir_all(&staging).with_context(|| format!("create {}", staging.display()))?;
     let archive = staging.join("component.tar.gz");
     fs::write(&archive, &bytes).with_context(|| format!("write {}", archive.display()))?;
-    run("tar", &["-xzf", &archive.to_string_lossy(), "-C", &staging.to_string_lossy()])
-        .context("unpack component")?;
+    run(
+        "tar",
+        &[
+            "-xzf",
+            &archive.to_string_lossy(),
+            "-C",
+            &staging.to_string_lossy(),
+        ],
+    )
+    .context("unpack component")?;
 
     let binary = find_file(&staging, "bluetoothd")
         .ok_or_else(|| anyhow!("archive contains no bluetoothd"))?;
@@ -191,7 +201,11 @@ async fn install_bluetoothd(component: &DesiredComponent) -> Result<ComponentSta
     let build_prefix = read_build_prefix(&binary)?;
     info!("component was built with prefix {}", build_prefix.display());
 
-    install_file(&binary, &PathBuf::from(INSTALL_ROOT).join("libexec/bluetoothd"), 0o755)?;
+    install_file(
+        &binary,
+        &PathBuf::from(INSTALL_ROOT).join("libexec/bluetoothd"),
+        0o755,
+    )?;
 
     // Storage has to live where the binary was told to look, and it has to be the real one so
     // pairings survive a reboot.

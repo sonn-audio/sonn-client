@@ -41,8 +41,6 @@ pub enum VolumeIntent {
     Step(i16),
     /// Absolute.
     Set(u8),
-    /// Mute or unmute.
-    Mute(bool),
 }
 
 #[derive(Debug, Clone)]
@@ -340,7 +338,6 @@ fn apply_volume(
             next.volume = level.min(100);
             next.muted = false;
         }
-        VolumeIntent::Mute(muted) => next.muted = muted,
     }
 
     if next == entry.last_pushed {
@@ -436,7 +433,9 @@ async fn reconcile_sources(
                 .sample_rate
                 .unwrap_or(source::DEFAULT_SAMPLE_RATE),
             channels: desired_source.channels.unwrap_or(source::DEFAULT_CHANNELS),
-            bit_depth: desired_source.bit_depth.unwrap_or(source::DEFAULT_BIT_DEPTH),
+            bit_depth: desired_source
+                .bit_depth
+                .unwrap_or(source::DEFAULT_BIT_DEPTH),
             frame_ms: desired_source.frame_ms.unwrap_or(source::DEFAULT_FRAME_MS),
             controls: desired_source
                 .controls

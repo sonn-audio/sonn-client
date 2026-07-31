@@ -71,11 +71,10 @@ pub fn discover_server(
                         .cloned()
                         .unwrap_or_else(|| format!("{}/sonnclients/register", api_prefix)),
                 );
-                let status_path = normalize_path(
-                    txt.get("client_status")
-                        .cloned()
-                        .unwrap_or_else(|| format!("{}/sonnclients/{{device_id}}/status", api_prefix)),
-                );
+                let status_path =
+                    normalize_path(txt.get("client_status").cloned().unwrap_or_else(|| {
+                        format!("{}/sonnclients/{{device_id}}/status", api_prefix)
+                    }));
                 candidates.push(DiscoveredServer {
                     base_url,
                     register_path,

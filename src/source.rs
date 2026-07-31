@@ -283,16 +283,15 @@ pub async fn run_session(
                                     status.set_state_ok(STATE_STREAMING);
                                 }
                             }
-                            Some(SourceCommandType::Stop) => {
-                                if streaming && !params.always_on {
-                                    info!(client_id = %params.client_id, "server asked us to stop");
-                                    streaming = false;
-                                    sender.send_input_stream_end().await?;
-                                    reporter.reset();
-                                    send_state(&sender, SourceStateType::Idle, 0.0, SourceSignal::Absent).await?;
-                                    status.set_state_ok(STATE_CONNECTED);
-                                    status.set_signal(0.0, signal_name(SourceSignal::Absent));
-                                }
+                            Some(SourceCommandType::Stop) if streaming && !params.always_on => {
+                                info!(client_id = %params.client_id, "server asked us to stop");
+                                streaming = false;
+                                sender.send_input_stream_end().await?;
+                                reporter.reset();
+                                send_state(&sender, SourceStateType::Idle, 0.0, SourceSignal::Absent)
+                                    .await?;
+                                status.set_state_ok(STATE_CONNECTED);
+                                status.set_signal(0.0, signal_name(SourceSignal::Absent));
                             }
                             _ => {}
                         }
@@ -405,7 +404,7 @@ fn start_capture(
     tx: mpsc::Sender<CapturedChunk>,
 ) -> Result<cpal::Stream> {
     let config = cpal::StreamConfig {
-        channels: params.channels.try_into().unwrap_or(2),
+        channels: params.channels,
         sample_rate: params.sample_rate,
         buffer_size: cpal::BufferSize::Default,
     };
@@ -563,10 +562,8 @@ impl SignalReporter {
         let state_changed = self.last_state != Some(state);
         let signal_changed = previous != Some(signal);
         self.last_state = Some(state);
-        (state_changed || signal_changed || event.is_some()).then_some(SignalUpdate {
-            signal,
-            event,
-        })
+        (state_changed || signal_changed || event.is_some())
+            .then_some(SignalUpdate { signal, event })
     }
 }
 
@@ -632,17 +629,27 @@ mod tests {
             hold_ms: 0,
         });
         let _ = reporter.observe(0.0, SourceStateType::Idle);
-        let update = reporter
+
+        // A change becomes a candidate on the observation that sees it and is confirmed on the
+        // next one -- even at hold zero, which is how the reference client behaves. That costs one
+        // frame (20 ms by default) and buys identical behaviour against the same server, so it is
+        // the expectation rather than something to work around.
+        let candidate = reporter.observe(0.9, SourceStateType::Idle);
+        assert!(candidate.is_none_or(|update| update.event.is_none()));
+
+        let confirmed = reporter
             .observe(0.9, SourceStateType::Idle)
-            .expect("a transition is reported");
+            .expect("the sustained change is reported");
         assert!(matches!(
-            update.event,
+            confirmed.event,
             Some(SourceClientCommandType::Started)
         ));
+        assert_eq!(confirmed.signal, SourceSignal::Present);
+
         // Still loud: nothing new to say.
         assert!(reporter
             .observe(0.9, SourceStateType::Idle)
-            .is_none_or(|u| u.event.is_none()));
+            .is_none_or(|update| update.event.is_none()));
     }
 
     #[test]

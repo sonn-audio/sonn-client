@@ -11,9 +11,7 @@
 
 use crate::devices;
 use crate::hooks::VolumeHook;
-use crate::status::{
-    PlayerHandle, STATE_CONNECTED, STATE_CONNECTING, STATE_IDLE, STATE_STREAMING,
-};
+use crate::status::{PlayerHandle, STATE_CONNECTED, STATE_CONNECTING, STATE_IDLE, STATE_STREAMING};
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::*;
 use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
@@ -111,18 +109,8 @@ pub async fn run_session(
             volume: Some(settings.volume),
             muted: Some(settings.muted),
             static_delay_ms: Some(settings.static_delay_ms),
-            // `try_into` on every width-uncertain field: the crate is pre-1.0 and these are plain
-            // integers, so this keeps us compiling across a minor bump instead of pinning a width.
-            required_lead_time_ms: params
-                .required_lead_time_ms
-                .unwrap_or(DEFAULT_LEAD_MS)
-                .try_into()
-                .ok(),
-            min_buffer_ms: params
-                .buffer_ms
-                .unwrap_or(DEFAULT_BUFFER_MS)
-                .try_into()
-                .ok(),
+            required_lead_time_ms: Some(params.required_lead_time_ms.unwrap_or(DEFAULT_LEAD_MS)),
+            min_buffer_ms: Some(params.buffer_ms.unwrap_or(DEFAULT_BUFFER_MS)),
             supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
         })
         .build()

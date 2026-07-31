@@ -126,7 +126,9 @@ async fn discover_remote() -> Result<PairedDevice> {
             continue;
         };
         let mut parts = rest.split_whitespace();
-        let Some(address) = parts.next() else { continue };
+        let Some(address) = parts.next() else {
+            continue;
+        };
         let name = parts.collect::<Vec<_>>().join(" ");
         if name.to_uppercase().starts_with(REMOTE_NAME_PREFIX) {
             return Ok(PairedDevice {
@@ -135,7 +137,10 @@ async fn discover_remote() -> Result<PairedDevice> {
             });
         }
     }
-    anyhow::bail!("no {}* device advertised while scanning", REMOTE_NAME_PREFIX)
+    anyhow::bail!(
+        "no {}* device advertised while scanning",
+        REMOTE_NAME_PREFIX
+    )
 }
 
 /// Run `bluetoothctl` with a script on stdin. Scanning has no natural end, so the caller's timeout is
@@ -175,7 +180,10 @@ async fn bluetoothctl(args: &[&str]) -> Result<()> {
 }
 
 fn last_lines(text: &str, count: usize) -> String {
-    let lines: Vec<&str> = text.lines().filter(|line| !line.trim().is_empty()).collect();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
     lines[lines.len().saturating_sub(count)..].join(" | ")
 }
 
