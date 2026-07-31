@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  release:
+    types: [published]
+  workflow_run:
+    workflows: ["Semantic Release"]
+    types:
+      - completed
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (vX.Y.Z). Leave empty to use latest release."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    continue-on-error: ${{ matrix.allow_failure }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            allow_failure: false
+          - target: aarch64-unknown-linux-gnu
+            allow_failure: false
+          - target: armv7-unknown-linux-gnueabihf
+            allow_failure: false
+          - target: arm-unknown-linux-gnueabihf
+            allow_failure: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve release tag
+        id: resolve_tag
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          event_name = os.environ.get("GITHUB_EVENT_NAME")
+          input_tag = os.environ.get("INPUT_TAG", "").strip()
+
+          if event_name == "release":
+              tag = os.environ.get("GITHUB_REF_NAME", "")
+          elif input_tag:
+              tag = input_tag
+          else:
+              result = subprocess.run(
+                  ["git", "tag", "--sort=-creatordate"],
+                  capture_output=True,
+                  text=True,
+                  check=True,
+              )
+              tag = next((line for line in result.stdout.splitlines() if line.strip()), "")
+
+          if not tag:
+              print("Could not resolve release tag", file=sys.stderr)
+              sys.exit(1)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"tag={tag}\n")
+          PY
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+      - name: Install cross
+        run: cargo install cross --locked
+      - name: Build
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          version="${{ steps.resolve_tag.outputs.tag }}"
+          version="${version#v}"
+          bin_dir="target/${{ matrix.target }}/release"
+          tar -czf "sonn-client-${version}-${{ matrix.target }}.tar.gz" -C "${bin_dir}" sonn-client
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.resolve_tag.outputs.tag }}
+          files: sonn-client-*.tar.gz
+          fail_on_unmatched_files: true
+          generate_release_notes: true

@@ -1,0 +1,30 @@
+# /etc/sonn-client/config.toml
+#
+# Written on first run. Everything that decides what this device *plays* lives on the server; what is
+# here is identity and, at most, which server to attach to.
+
+# Stable device identity. Changing it makes the server treat this as a new device, so every zone
+# pointing at the old id stops playing.
+device_id = "sonn-kitchen-pi-9e2f41a7"
+
+# Only needed with several audioservers on one network. Matched against the advertised mDNS instance
+# name and the `mac` TXT record (any separator or case).
+# preferred_server_name = "Test Audioserver"
+# preferred_server_mac = "00:0c:29:0e:54:97"
+
+# Skip mDNS entirely, for a network where discovery does not cross a VLAN.
+# server_url = "http://192.168.1.209:7090"
+
+# Run when this device joins or leaves a server. SONN_EVENT is `connected` or `disconnected`;
+# SONN_SERVER_URL, SONN_SERVER_NAME and SONN_CLIENT_ID are also in the environment. Use it to switch
+# an amplifier on with the room.
+# on_connect = "/usr/local/bin/amp-power"
+
+# Run for every command the server queues for this device, as `<script> <command> [args...]`.
+# on_command = "/usr/local/bin/sonn-device-cmd"
+
+# Fallback hardware volume, called as `<command> <level 0-100>` with 0 for muted -- the same contract
+# as the reference client's --hook-set-volume, so an existing script works unchanged. When a hook is
+# in use the software mixer stays at unity, so the level is not attenuated twice.
+# Normally the server pushes this per player; this is the local default.
+# volume_hook = "/usr/local/bin/beolab-volume"

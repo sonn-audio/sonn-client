@@ -1,0 +1,43 @@
+# cpal links against ALSA, so every cross target needs the ALSA headers/libs for *that*
+# architecture, not the host's.
+[target.x86_64-unknown-linux-gnu]
+pre-build = ["apt-get update && apt-get install -y libasound2-dev pkg-config"]
+
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+  "dpkg --add-architecture arm64",
+  "apt-get update",
+  "apt-get install -y libasound2:arm64 libasound2-dev:arm64 libc6-dev:arm64 pkg-config"
+]
+[target.aarch64-unknown-linux-gnu.env]
+passthrough = [
+  "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig",
+  "PKG_CONFIG_ALLOW_CROSS=1",
+  "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=-L/usr/lib/aarch64-linux-gnu"
+]
+
+[target.armv7-unknown-linux-gnueabihf]
+pre-build = [
+  "dpkg --add-architecture armhf",
+  "apt-get update",
+  "apt-get install -y libasound2:armhf libasound2-dev:armhf libc6-dev:armhf pkg-config"
+]
+[target.armv7-unknown-linux-gnueabihf.env]
+passthrough = [
+  "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig",
+  "PKG_CONFIG_ALLOW_CROSS=1",
+  "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-L/usr/lib/arm-linux-gnueabihf"
+]
+
+[target.arm-unknown-linux-gnueabihf]
+pre-build = [
+  "dpkg --add-architecture armhf",
+  "apt-get update",
+  "apt-get install -y libasound2:armhf libasound2-dev:armhf libc6-dev:armhf pkg-config"
+]
+[target.arm-unknown-linux-gnueabihf.env]
+passthrough = [
+  "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig",
+  "PKG_CONFIG_ALLOW_CROSS=1",
+  "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-L/usr/lib/arm-linux-gnueabihf"
+]
