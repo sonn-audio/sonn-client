@@ -11,7 +11,7 @@ use mdns_sd::{ServiceDaemon, ServiceEvent};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{info, warn};
 
 const SERVICE_TYPE: &str = "_sonncore._tcp.local.";
 const DEFAULT_REGISTER_PATH: &str = "/api/sonnclients/register";
@@ -42,10 +42,14 @@ impl DiscoveredServer {
     }
 }
 
-pub fn discover_server(
+/// Every audioserver on the network, in the order this device should try them.
+///
+/// A list rather than one answer: a server that turns out not to speak to Sonn clients at all should
+/// cost one attempt, not the whole search. The caller walks the list and remembers what it learned.
+pub fn discover_servers(
     preferred_name: Option<&str>,
     preferred_mac: Option<&str>,
-) -> Result<DiscoveredServer> {
+) -> Result<Vec<DiscoveredServer>> {
     let mdns = ServiceDaemon::new().context("start mDNS daemon")?;
     let receiver = mdns.browse(SERVICE_TYPE).context("browse mDNS services")?;
     let deadline = Instant::now() + Duration::from_secs(8);
@@ -92,59 +96,69 @@ pub fn discover_server(
     if candidates.is_empty() {
         anyhow::bail!("no _sonncore._tcp services found");
     }
-    Ok(select_server(candidates, preferred_name, preferred_mac))
+    Ok(rank_servers(candidates, preferred_name, preferred_mac))
 }
 
-/// Pick a server from what mDNS turned up, honouring the config's preferences.
+/// Order what mDNS turned up, honouring the config's preferences.
 ///
-/// Preferences are applied even when only one server answered: with several audioservers on one
-/// network, silently attaching to the wrong one is worse than waiting. We still fall through to the
-/// first candidate rather than failing, so a device whose preferred server is temporarily down keeps
-/// working -- but it says so.
-fn select_server(
-    mut candidates: Vec<DiscoveredServer>,
+/// A preference is an instruction, not a hint: if the config names a server, only that server is
+/// returned. Attaching to a different audioserver because the named one is momentarily quiet looks
+/// like recovery and behaves like a fault -- the device registers somewhere it was never meant to be,
+/// and the room it belongs to stays silent while the log says everything is fine. Waiting says so
+/// instead, once per attempt, with the names that did answer.
+fn rank_servers(
+    candidates: Vec<DiscoveredServer>,
     preferred_name: Option<&str>,
     preferred_mac: Option<&str>,
-) -> DiscoveredServer {
-    if let Some(mac) = preferred_mac.map(normalize_mac).filter(|m| !m.is_empty()) {
-        if let Some(server) = candidates
+) -> Vec<DiscoveredServer> {
+    let seen = || {
+        candidates
             .iter()
-            .find(|server| server.txt.get("mac").map(|v| normalize_mac(v)) == Some(mac.clone()))
-        {
-            return server.clone();
+            .map(|c| format!("{} at {}", c.instance_name, c.base_url))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    if let Some(mac) = preferred_mac.map(normalize_mac).filter(|m| !m.is_empty()) {
+        let matched: Vec<DiscoveredServer> = candidates
+            .iter()
+            .filter(|server| server.txt.get("mac").map(|v| normalize_mac(v)) == Some(mac.clone()))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            warn!(
+                "waiting: preferred_server_mac is {} and no server advertises it (saw: {})",
+                mac,
+                seen()
+            );
         }
-        warn!(
-            "no server advertising mac {}; ignoring preferred_server_mac",
-            mac
-        );
+        return matched;
     }
 
     if let Some(name) = preferred_name.map(str::trim).filter(|n| !n.is_empty()) {
-        if let Some(server) = candidates
+        let matched: Vec<DiscoveredServer> = candidates
             .iter()
-            .find(|server| server.instance_name.eq_ignore_ascii_case(name))
-        {
-            return server.clone();
+            .filter(|server| server.instance_name.eq_ignore_ascii_case(name))
+            .cloned()
+            .collect();
+        if matched.is_empty() {
+            warn!(
+                "waiting: preferred_server_name is {:?} and no server answers to it (saw: {})",
+                name,
+                seen()
+            );
         }
-        warn!(
-            "no server named {:?}; ignoring preferred_server_name (saw: {})",
-            name,
-            candidates
-                .iter()
-                .map(|c| c.instance_name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        return matched;
     }
 
     if candidates.len() > 1 {
-        warn!(
-            "{} servers found and no preference matched; using {}",
+        info!(
+            "{} audioservers found, trying them in order: {}",
             candidates.len(),
-            candidates[0].base_url
+            seen()
         );
     }
-    candidates.remove(0)
+    candidates
 }
 
 /// Compare MAC addresses by their hex digits only: the server advertises `000C290E5497` while a
@@ -272,10 +286,10 @@ mod tests {
                 "http://192.168.1.209:7090",
             ),
         ];
-        let picked = select_server(candidates.clone(), None, Some("00:0c:29:0e:54:97"));
-        assert_eq!(picked.base_url, "http://192.168.1.209:7090");
-        let picked = select_server(candidates, None, Some("000c290e5497"));
-        assert_eq!(picked.base_url, "http://192.168.1.209:7090");
+        let picked = rank_servers(candidates.clone(), None, Some("00:0c:29:0e:54:97"));
+        assert_eq!(picked[0].base_url, "http://192.168.1.209:7090");
+        let picked = rank_servers(candidates, None, Some("000c290e5497"));
+        assert_eq!(picked[0].base_url, "http://192.168.1.209:7090");
     }
 
     #[test]
@@ -288,8 +302,22 @@ mod tests {
                 "http://192.168.1.209:7090",
             ),
         ];
-        let picked = select_server(candidates, Some("Test Audioserver"), None);
-        assert_eq!(picked.base_url, "http://192.168.1.209:7090");
+        let picked = rank_servers(candidates, Some("Test Audioserver"), None);
+        assert_eq!(picked.len(), 1, "a named server is the only candidate");
+        assert_eq!(picked[0].base_url, "http://192.168.1.209:7090");
+    }
+
+    #[test]
+    fn a_preference_that_matches_nothing_yields_nothing() {
+        let candidates = vec![server(
+            "Audioserver",
+            "000C29678C56",
+            "http://192.168.1.252:7090",
+        )];
+        // The failure this prevents: the device attaches to the audioserver it was told not to use,
+        // registers there, and the room it belongs to stays silent while every log line reads fine.
+        assert!(rank_servers(candidates.clone(), Some("Test Audioserver"), None).is_empty());
+        assert!(rank_servers(candidates, None, Some("00:0c:29:0e:54:97")).is_empty());
     }
 
     #[test]
