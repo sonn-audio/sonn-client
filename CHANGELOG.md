@@ -1,3 +1,10 @@
+## [1.0.6](https://github.com/sonn-audio/sonn-client/compare/v1.0.5...v1.0.6) (2026-07-31)
+
+
+### Bug Fixes
+
+* **config:** never let a typo change who this device is ([f9fa253](https://github.com/sonn-audio/sonn-client/commit/f9fa253146f1e3c46a07b7c77dd81cf871bd5a07))
+
 ## [1.0.5](https://github.com/sonn-audio/sonn-client/compare/v1.0.4...v1.0.5) (2026-07-31)
 
 
