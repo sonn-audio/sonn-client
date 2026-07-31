@@ -1,3 +1,12 @@
+## [1.0.4](https://github.com/sonn-audio/sonn-client/compare/v1.0.3...v1.0.4) (2026-07-31)
+
+
+### Bug Fixes
+
+* **devices:** offer a card by its name, never by its number ([6b30418](https://github.com/sonn-audio/sonn-client/commit/6b30418d9f17fc945ad28cf890f553aba0fdfbf5))
+* **discovery:** treat a named server as an instruction, and take no for an answer ([ed4b224](https://github.com/sonn-audio/sonn-client/commit/ed4b224fef3080440abb0a65aa35867ca250cdd3))
+* stop libasound writing its own configuration problems to the journal ([f1b5d20](https://github.com/sonn-audio/sonn-client/commit/f1b5d20bd95f0b005d2ec0042b2c31b1eec8f16d))
+
 ## [1.0.3](https://github.com/sonn-audio/sonn-client/compare/v1.0.2...v1.0.3) (2026-07-31)
 
 
