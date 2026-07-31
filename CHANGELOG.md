@@ -1,3 +1,10 @@
+## [1.0.1](https://github.com/sonn-audio/sonn-client/compare/v1.0.0...v1.0.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* build for 32-bit Raspberry Pi OS, and name sound cards the way cpal does ([6ff14b0](https://github.com/sonn-audio/sonn-client/commit/6ff14b00dce435f66b102e3814cb00f10ef51fd9))
+
 # 1.0.0 (2026-07-31)
 
 
