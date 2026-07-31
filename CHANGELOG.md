@@ -1,3 +1,18 @@
+# 1.0.0 (2026-07-31)
+
+
+### Bug Fixes
+
+* depend on the fork's integration branch, not the source one ([754c261](https://github.com/sonn-audio/sonn-client/commit/754c261a27cbace1ce535cba840925d81e34f200))
+* make it compile, and fix what compiling found ([93c26a3](https://github.com/sonn-audio/sonn-client/commit/93c26a3cbf526621644882a30ac8cb377771e426))
+* match the management endpoints the server actually serves ([dbecc84](https://github.com/sonn-audio/sonn-client/commit/dbecc84a3707e92c218b29295e4f856e6d09c4cd))
+
+
+### Features
+
+* line-in as a sendspin source, the Beoremote One bridge, and the BlueZ it needs ([e1c434c](https://github.com/sonn-audio/sonn-client/commit/e1c434ca6f80a6bae2e487799abe2bf26193ff09))
+* sendspin-only client that is installed once and configured from the server ([a70af85](https://github.com/sonn-audio/sonn-client/commit/a70af85a4dd43d450f192a6dd5f24646faf8ab55))
+
 # Changelog
 
 All notable changes to this project are documented here. Releases are cut by semantic-release from
