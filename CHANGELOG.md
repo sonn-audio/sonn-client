@@ -1,3 +1,10 @@
+## [1.0.7](https://github.com/sonn-audio/sonn-client/compare/v1.0.6...v1.0.7) (2026-07-31)
+
+
+### Bug Fixes
+
+* **devices:** a card being played through is still a card ([e70b81a](https://github.com/sonn-audio/sonn-client/commit/e70b81a35155a1d0fc5ae9df2140bbfac01cf6a3))
+
 ## [1.0.6](https://github.com/sonn-audio/sonn-client/compare/v1.0.5...v1.0.6) (2026-07-31)
 
 
