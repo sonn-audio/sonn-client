@@ -7,6 +7,7 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -44,6 +45,21 @@ pub struct Config {
     /// `<command> <level 0-100>`. Muted is sent as 0.
     #[serde(default)]
     pub volume_hook: Option<String>,
+    /// Anything in the file this build does not know.
+    ///
+    /// Kept rather than rejected, because a config written by a newer client should survive a
+    /// downgrade untouched. Kept rather than *silently* dropped, because the other thing that lands
+    /// here is a misspelled setting, and a setting that does nothing while looking right is the
+    /// hardest kind of failure to see from the far end of a network.
+    #[serde(flatten)]
+    pub unrecognised: BTreeMap<String, toml::Value>,
+}
+
+impl Config {
+    /// Say what in this file will be ignored. Empty when everything was understood.
+    pub fn unrecognised_keys(&self) -> Vec<&str> {
+        self.unrecognised.keys().map(String::as_str).collect()
+    }
 }
 
 pub fn preferred_config_path() -> PathBuf {
@@ -94,6 +110,7 @@ pub fn load_or_create_config() -> Result<(Config, PathBuf)> {
         on_connect: None,
         on_command: None,
         volume_hook: None,
+        unrecognised: BTreeMap::new(),
     };
     let path = write_config(&config)?;
     Ok((config, path))
@@ -152,4 +169,33 @@ fn try_write(path: &Path, contents: &str) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_setting_this_build_does_not_know_is_kept_and_named() {
+        let config: Config = toml::from_str(
+            r#"
+device_id = "sonn-test"
+preferred_server_name = "Test Audioserver"
+prefered_server_name = "typo, one r short"
+"#,
+        )
+        .expect("an unknown key is not a parse error");
+
+        assert_eq!(
+            config.preferred_server_name.as_deref(),
+            Some("Test Audioserver")
+        );
+        // The failure this catches: a setting that looks right in the file, does nothing, and says
+        // nothing about it.
+        assert_eq!(config.unrecognised_keys(), vec!["prefered_server_name"]);
+
+        // And it survives a rewrite, so a config written by a newer client is not quietly stripped.
+        let written = toml::to_string_pretty(&config).expect("serialize");
+        assert!(written.contains("prefered_server_name"), "{written}");
+    }
 }

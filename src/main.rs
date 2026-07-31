@@ -119,6 +119,19 @@ async fn run() -> Result<()> {
     // Said out loud at startup, because the alternative is reading a log full of the wrong server and
     // having no way to tell whether the config was even picked up.
     info!("{}", describe_server_preference(&config));
+    let unrecognised = config.unrecognised_keys();
+    if !unrecognised.is_empty() {
+        warn!(
+            "{} contains {} this build does not know, which will be ignored: {}",
+            config_path.display(),
+            if unrecognised.len() == 1 {
+                "a setting"
+            } else {
+                "settings"
+            },
+            unrecognised.join(", ")
+        );
+    }
 
     // Servers that answered "no such endpoint", and when. Cleared by a restart, which is the same
     // moment someone would have upgraded the server they were expecting to use.
@@ -618,6 +631,7 @@ mod tests {
             on_connect: None,
             on_command: None,
             volume_hook: None,
+            unrecognised: Default::default(),
         };
         assert!(describe_server_preference(&config).contains("no server pinned"));
 
