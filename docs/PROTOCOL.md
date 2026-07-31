@@ -66,9 +66,27 @@ replies with the desired state.
       "is_default": true
     }
   ],
-  "capabilities": { "codecs": ["flac", "opus", "pcm"], "max_players": 4, "features": [] }
+  "inputs": [
+    {
+      "id": "hw:CARD=CODEC,DEV=0",
+      "name": "USB Audio CODEC",
+      "channels": 2,
+      "sample_rates": [44100, 48000],
+      "is_default": true
+    }
+  ],
+  "capabilities": {
+    "codecs": ["flac", "opus", "pcm"],
+    "max_players": 4,
+    "features": ["source", "beoremote", "components"]
+  },
+  "components": [{ "name": "beoremote-bluetoothd", "state": "absent" }]
 }
 ```
+
+`inputs` is the same shape as `outputs` — to the server a sound card is a sound card — and feeds the
+source role below. `features` says what this build can be asked to do; `components` says what is
+installed of the software that some of those features need.
 
 `outputs[].id` is a cpal device id — on Linux the ALSA name. It is what the server sends back in
 `players[].output`, so it has to be stored as opaque text and handed back unchanged. The list is
@@ -103,10 +121,33 @@ reach back in.
       "muted": false,
       "static_delay_ms": 0,
       "clock_rtt_ms": 1.34,
-      "clock_quality": "Good",
+      "clock_quality": "good",
       "last_error": null
     }
-  ]
+  ],
+  "sources": [
+    {
+      "client_id": "sonn-kitchen-pi-9e2f41a7-linein",
+      "state": "streaming",
+      "input": "hw:CARD=CODEC,DEV=0",
+      "codec": "pcm",
+      "sample_rate": 48000,
+      "bit_depth": 16,
+      "channels": 2,
+      "level": 0.31,
+      "signal": "present",
+      "clock_rtt_ms": 1.21
+    }
+  ],
+  "components": [
+    { "name": "beoremote-bluetoothd", "version": "5.45-bo1", "state": "running" }
+  ],
+  "beoremote": {
+    "state": "connected",
+    "zone_id": 28,
+    "menu_revision": "5787de5a",
+    "hid_connected": true
+  }
 }
 ```
 
@@ -143,6 +184,39 @@ broken.
       "volume_hook": null
     }
   ],
+  "sources": [
+    {
+      "client_id": "sonn-kitchen-pi-9e2f41a7-linein",
+      "name": "BeoSound 9000",
+      "input": "hw:CARD=CODEC,DEV=0",
+      "enabled": true,
+      "sample_rate": 48000,
+      "bit_depth": 16,
+      "channels": 2,
+      "frame_ms": 20,
+      "threshold_db": -45.0,
+      "hold_ms": 2000,
+      "controls": ["activate", "deactivate", "play", "pause", "next", "previous"],
+      "control_hook": "/usr/local/bin/ml-cmd",
+      "always_on": false
+    }
+  ],
+  "beoremote": {
+    "enabled": true,
+    "zone_id": 28,
+    "menu_poll_ms": 10000,
+    "volume_player": "sonn-kitchen-pi-9e2f41a7",
+    "volume_step": 4
+  },
+  "components": [
+    {
+      "name": "beoremote-bluetoothd",
+      "version": "5.45-bo1",
+      "url": "https://.../beoremote-bluetoothd-5.45-bo1-aarch64.tar.gz",
+      "sha256": "…",
+      "enabled": true
+    }
+  ],
   "commands": []
 }
 ```
@@ -173,6 +247,102 @@ Semantics the server should count on:
   vocabulary is the server's; the client passes each one to its command hook untouched, so the server
   can add commands without a client release.
 
+## Sources (line-in over Sendspin)
+
+A source is a player in reverse: the device captures a local input and streams it *to* the server,
+which resamples, mixes and distributes it like any other audio. The zone side is unchanged — the
+server already maps a Sendspin source client to a line-in input by `client_id`.
+
+The client implements `source@v1` as written in the spec and in the Python reference client:
+
+- `client/hello` carries `source@v1_support` with the capture format, the transport controls this
+  input will act on, and `level` / `line_sense` reporting.
+- `server/command` drives it: `start` / `stop`, signal thresholds (`vad`), and transport controls for
+  the device on the other end of the cable.
+- `input_stream/start` announces each stream's format before its first frame; `input_stream/end` ends
+  it; `input_stream/request-format` is answered by re-announcing the capture format, since the client
+  produces exactly one.
+- Audio goes up as binary type 12 frames, timestamped in the *server's* clock.
+- `client/state` reports capture state, level and signal presence; `client/command` reports
+  `started` / `stopped` when the level crosses the threshold and stays across it.
+
+Level and signal are reported **whether or not the source is streaming**. That is the whole point of
+line sensing: nobody can start a turntable remotely, so the device says "I hear something" and the
+server decides whether that means the zone should switch to it.
+
+`control_hook` is what makes a non-network device usable: the server sends `activate` when a zone
+selects this input, and the hook turns that into whatever the hardware understands — a MasterLink
+telegram for a BeoSound 9000, a relay, an IR blast. Without it the chain deadlocks: the input produces
+no audio until it is switched on, and nothing switches it on because nothing asked.
+
+Support for this role is not in the upstream Rust library yet. It lives in our fork
+(`sonn-audio/sendspin-rs`, branch `feat/source-v1`) as one self-contained commit so it can go upstream
+as a PR; `Cargo.toml` points at it.
+
+## Beoremote One
+
+A Beoremote One paired to a stock Linux box is a keyboard: press MUSIC and the display shows three
+dots, because the list has to come from the host. B&O's own BlueZ plugin serves that list and exposes
+two unix sockets for whoever fills it in. This client is that "whoever", replacing the Python bridge
+that used to sit next to the player.
+
+```text
+/var/run/beoremote_one_socket   menus, volume, selections   (plugin listens, we connect)
+/tmp/streamsdk_hog              raw 2-byte HID key reports  (we listen, hog connects)
+```
+
+- The **menu is the server's**. `GET /api/beoremote/zones/{zone}/menu` returns sources, the one
+  submenu and a revision; picks go back to `POST …/select` carrying that revision, so a list that
+  changed since it was rendered cannot start the wrong thing. A new playlist appears on the remote
+  with nothing deployed on the device.
+- **Keys go up as raw codes** to `POST …/key`. Only the server knows what the zone is playing — a
+  source picked in the app never passes through the device — so it decides whether `next` advances a
+  queue or becomes a Beo4 command on a MasterLink bus.
+- **Volume stays local.** It arrives in bursts (six presses in a row is normal) and has to keep
+  working while the server is briefly away, so it is applied to the player directly and reported back
+  upstream in `client/state`. That reporting is new: with the old bridge the zone slider did not
+  follow the remote.
+
+`hid_connected` in the status report is worth watching: while that socket has no peer, bluetoothd
+falls back to uHID and the keys arrive as evdev events that nothing reads. The listener is therefore
+created before anything else, because the fallback is decided per connection and is sticky.
+
+## Managed components
+
+`beoremote-bluetoothd` — B&O's patched BlueZ 5.45 — is fetched, verified and installed by the client
+on request, rather than being part of the binary. Two reasons, both decisive:
+
+- It is **GPLv2**. B&O publish their BlueZ patches because the licence leaves them no choice; linking
+  that daemon into this client would relicense the client.
+- It is a whole `bluetoothd` that takes over the Bluetooth adapter, which most devices running this
+  client have no use for.
+
+So the server names a version, a URL and a **sha256** (required — this installs a daemon that owns the
+adapter), and the client does the rest: verify, unpack, install, write the unit, disable the stock
+`bluetooth.service` (both claim `org.bluez` and the same adapter), start it, and report the version
+back. `enabled: false` removes it again, leaving `/var/lib/bluetooth` alone so a remote does not have
+to be re-paired.
+
+One detail the artifact has to respect: **the install prefix is baked into the binary** by
+`./configure --prefix`, and it is not where the binary ends up. The client reads it back out of the
+ELF and creates the storage symlink and `main.conf` under *that* path. Guessing it wrong is silent —
+the daemon starts, reads no config, and stores pairings where nobody looks, which shows up as "the
+remote pairs but is gone after a reboot".
+
+Build the artifact from `beoremote-linux` (`./build.sh`, then tar up `bluetoothd` and
+`etc/bluetooth/main.conf`), one per architecture.
+
+## Pairing a remote
+
+`pair_remote` as a device command (or `sonn-client pair-remote [address]` by hand) opens a 90-second
+window: scan, pair, trust, connect. Progress comes back in the status report's `pairing` block, so the
+server can show it as a button with a result instead of an SSH session. `trust` is the step that is
+easy to forget and annoying to debug — without it every reconnect needs re-authorising, so the remote
+works once and then looks dead.
+
+It is driven through `bluetoothctl` rather than D-Bus on purpose: bluetoothd refuses to pair without
+an *agent* registered to answer its questions, and `bluetoothctl` brings one.
+
 ## What the server side needs (not yet built)
 
 The client is complete against this contract; the server end is not. In the audioserver repo:
@@ -194,18 +364,24 @@ The client is complete against this contract; the server end is not. In the audi
 5. **The zone-side link** — when a player is assigned to a zone, the zone's sendspin output config
    points at that `client_id`. Nothing else to wire: the client dials the server, so it appears in
    `sendspinCore.listClients()` and in `GET /transports/sendspin/clients` on its own.
+6. **Sources** need no new server code either: `SendspinLineInService` already maps a line-in input
+   whose `source.type` is `sendspin` to a client id, and consumes type-12 frames. What the admin UI
+   needs is the capture-device picker fed from `inputs`, and a way to set the same `client_id` on both
+   sides.
+7. **Beoremote** is already served by `/api/beoremote/zones/{zone}/…`; what is missing is somewhere in
+   the UI to say *which zone* a device's remote drives, which is the `beoremote` block above.
+8. **Component hosting** — somewhere to serve the `beoremote-bluetoothd` tarballs with a sha256. A
+   release of `beoremote-linux` per architecture is the obvious home; the server only needs to hand
+   out the URL.
 
 ## Roadmap on the device
 
-Two things are designed for but not implemented, both of which the hooks above already carry the
-plumbing for:
-
-- **Beoremote bridge.** A Beoremote One pairs over Bluetooth HID and arrives as an evdev keyboard.
-  Turning its keys into Sendspin group commands means adding the controller role to the client's
-  connection and mapping keycodes to media commands — the device sends, rather than only receives.
-  Volume keys are the one case worth special-handling: they map to the zone's volume, which is where
-  `volume_hook` and the 0–90 B&O scale meet.
-- **Managed binaries.** The custom Bluetooth binary needs to be installed and kept up to date from
-  the server. That is a `features`/`managed_binaries` field in the register payload plus a download
-  URL and version in the desired state, and a small verify-then-atomically-replace step on the
-  device — the same shape `install.sh` already uses for the client itself.
+- **MasterLink** is deliberately out of scope here. A BeoSound 9000 reaches the server as a *source*
+  and takes its commands through `control_hook`, which is where the existing `ml-cmd` script fits. The
+  bus itself stays where it already works.
+- **A pairing agent of our own.** `bluetoothctl` supplies the agent during a pairing window, which
+  covers pairing but not an unattended re-pair. A small `org.bluez.Agent1` implementation would remove
+  the last external dependency; it needs a D-Bus client, which nothing else here does.
+- **Opus or FLAC on the way up.** Sources send PCM: on a LAN it costs 1.5 Mbit/s and saves a Pi's CPU.
+  A wifi-only device with a long haul might prefer to encode, which is a decoder the *server* already
+  has.

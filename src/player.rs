@@ -19,12 +19,12 @@ use base64::prelude::*;
 use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
 use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
 use sendspin::protocol::messages::{
-    AudioFormatSpec, Message, PlayerCommand, PlayerCommandType, PlayerState, PlayerStateCommand,
-    PlayerV1Support,
+    AudioFormatSpec, ClientState, Message, PlayerCommand, PlayerCommandType, PlayerState,
+    PlayerStateCommand, PlayerV1Support,
 };
-use sendspin::ProtocolClientBuilder;
+use sendspin::{ProtocolClientBuilder, WsSender};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
@@ -41,6 +41,8 @@ const DEFAULT_BUFFER_MS: u32 = 500;
 const DEFAULT_LEAD_MS: u32 = 500;
 /// Room for a couple of seconds of 24-bit stereo, which is well past any lead the server asks for.
 const BUFFER_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
+/// How often the clock lock is copied into the status report.
+const CLOCK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What can change without dropping audio. Everything else lives in `PlayerParams` and a change
 /// there means a reconnect.
@@ -140,7 +142,7 @@ pub async fn run_session(
     let mut message_rx = connection.messages;
     let mut audio_rx = connection.audio;
     let clock_sync = connection.clock_sync;
-    let _sender = connection.sender;
+    let sender = connection.sender;
     let _guard = connection.guard;
 
     // With a hardware hook the software gain stays at unity: attenuating twice -- once in our mixer,
@@ -172,9 +174,21 @@ pub async fn run_session(
         .map_err(|err| anyhow!("open audio output: {}", err))
     };
 
+    // Clock sync is the library's own business: it sends `client/time` and consumes `server/time`
+    // without ever forwarding it here, so the only way to report on the lock is to look at the
+    // filter. Once a second is plenty for a number that moves in milliseconds.
+    let mut clock_report = tokio::time::interval(CLOCK_REPORT_INTERVAL);
+
     loop {
         tokio::select! {
-            // Live settings first: a volume command should not wait behind a queue of audio chunks.
+            _ = clock_report.tick() => {
+                let sync = clock_sync.lock();
+                let rtt_ms = sync.rtt_micros().map(|rtt| rtt as f64 / 1000.0);
+                let quality = format!("{:?}", sync.quality()).to_lowercase();
+                drop(sync);
+                status.set_clock(rtt_ms, Some(quality));
+            }
+            // Live settings before audio: a volume command should not wait behind a queue of chunks.
             changed = settings_rx.changed() => {
                 if changed.is_err() {
                     // The supervisor dropped us; it is already tearing this task down.
@@ -185,7 +199,7 @@ pub async fn run_session(
                     continue;
                 }
                 settings = next;
-                apply_settings(&settings, player.as_ref(), volume_hook, software_volume, status).await;
+                apply_settings(&settings, player.as_ref(), volume_hook, software_volume, status, &sender).await;
             }
             message = message_rx.recv() => {
                 // `None` is the socket closing: end the session so the supervisor can reconnect.
@@ -255,20 +269,6 @@ pub async fn run_session(
                         );
                         status.set_state_ok(STATE_STREAMING);
                     }
-                    Message::ServerTime(server_time) => {
-                        let received = now_micros();
-                        clock_sync.lock().update(
-                            server_time.client_transmitted,
-                            server_time.server_received,
-                            server_time.server_transmitted,
-                            received,
-                        );
-                        let sync = clock_sync.lock();
-                        let rtt_ms = sync.rtt_micros().map(|rtt| rtt as f64 / 1000.0);
-                        let quality = format!("{:?}", sync.quality());
-                        drop(sync);
-                        status.set_clock(rtt_ms, Some(quality));
-                    }
                     Message::StreamEnd(_) | Message::StreamClear(_) => {
                         if let Some(open) = player.as_ref() {
                             open.clear();
@@ -288,6 +288,7 @@ pub async fn run_session(
                                 volume_hook,
                                 software_volume,
                                 status,
+                                &sender,
                             )
                             .await;
                         }
@@ -405,6 +406,7 @@ async fn apply_settings(
     volume_hook: Option<&VolumeHook>,
     software_volume: bool,
     status: &PlayerHandle,
+    sender: &WsSender,
 ) {
     if let Some(open) = player {
         open.set_static_delay(settings.static_delay_ms);
@@ -418,6 +420,32 @@ async fn apply_settings(
     }
     status.set_volume(settings.volume, settings.muted);
     status.set_static_delay(settings.static_delay_ms);
+    report_state(sender, settings).await;
+}
+
+/// Tell the server where this player ended up.
+///
+/// It matters most when the change did *not* come from the server: a B&O remote turning the volume up
+/// is invisible otherwise, and the zone slider would sit at the old level until something else moved
+/// it. Echoing a change the server itself asked for is harmless -- the reference client does the same.
+async fn report_state(sender: &WsSender, settings: &LiveSettings) {
+    let state = ClientState {
+        state: None,
+        player: Some(PlayerState {
+            volume: Some(settings.volume),
+            muted: Some(settings.muted),
+            static_delay_ms: Some(settings.static_delay_ms),
+            required_lead_time_ms: None,
+            min_buffer_ms: None,
+            supported_commands: None,
+        }),
+        source: None,
+    };
+    if let Err(err) = sender.send_message(Message::ClientState(state)).await {
+        // Not fatal: the socket is about to be torn down anyway, and the next connection re-announces
+        // everything in its initial state.
+        debug!("could not report player state: {}", err);
+    }
 }
 
 /// Whether the open cpal stream can carry the next format or has to be reopened.
@@ -517,13 +545,6 @@ fn advertised_formats(params: &PlayerParams) -> Vec<AudioFormatSpec> {
         }
     }
     formats
-}
-
-fn now_micros() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_micros() as i64)
-        .unwrap_or_default()
 }
 
 #[cfg(test)]

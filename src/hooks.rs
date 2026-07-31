@@ -105,6 +105,30 @@ impl VolumeHook {
     }
 }
 
+/// Transport controls for the device wired to a source input.
+///
+/// The server decides *when* — it is the only party that knows a zone is listening to this input —
+/// and this runs whatever turns that into something the hardware understands: a MasterLink telegram
+/// for a BeoSound 9000, a GPIO for a relay, an IR blast. `activate` matters most: an input nobody
+/// switched on produces silence, and silence is indistinguishable from "not playing".
+#[derive(Clone)]
+pub struct ControlHook {
+    command: String,
+}
+
+impl ControlHook {
+    pub fn new(command: String) -> Self {
+        Self { command }
+    }
+
+    /// Run the hook as `<script> <control>`, with the control name passed through untouched so the
+    /// server can add to the vocabulary without a client release.
+    pub async fn run(&self, control: &str) {
+        info!("running source control hook: {}", control);
+        run(shell_argv(&self.command, control, &[]), "source control").await;
+    }
+}
+
 /// Spawn via a shell so a configured hook can carry its own arguments, not just be a bare path.
 ///
 /// The command text is left exactly as configured and the hook's arguments arrive as the script's

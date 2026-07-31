@@ -4,7 +4,10 @@
 //! Players write here from their own tasks; the poller reads a snapshot. Nothing blocks on anything:
 //! a lock is only ever held for a field assignment, never across an await.
 
-use crate::models::PlayerStatusReport;
+use crate::models::{
+    BeoremoteStatusReport, ComponentStatus, PairingStatusReport, PlayerStatusReport,
+    SourceStatusReport,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,11 +54,47 @@ impl PlayerSnapshot {
     }
 }
 
+#[derive(Debug, Clone)]
+struct SourceSnapshot {
+    state: String,
+    input: Option<String>,
+    codec: Option<String>,
+    sample_rate: Option<u32>,
+    bit_depth: Option<u8>,
+    channels: Option<u16>,
+    level: Option<f32>,
+    signal: Option<String>,
+    clock_rtt_ms: Option<f64>,
+    last_error: Option<String>,
+}
+
+impl SourceSnapshot {
+    fn new(input: Option<String>) -> Self {
+        Self {
+            state: STATE_IDLE.to_string(),
+            input,
+            codec: None,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            level: None,
+            signal: None,
+            clock_rtt_ms: None,
+            last_error: None,
+        }
+    }
+}
+
 type Shared = Arc<Mutex<HashMap<String, PlayerSnapshot>>>;
+type SharedSources = Arc<Mutex<HashMap<String, SourceSnapshot>>>;
 
 #[derive(Clone)]
 pub struct Registry {
     players: Shared,
+    sources: SharedSources,
+    components: Arc<Mutex<Vec<ComponentStatus>>>,
+    pairing: Arc<Mutex<Option<PairingStatusReport>>>,
+    beoremote: Arc<Mutex<Option<BeoremoteStatusReport>>>,
     started: Instant,
 }
 
@@ -63,8 +102,115 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             players: Arc::new(Mutex::new(HashMap::new())),
+            sources: Arc::new(Mutex::new(HashMap::new())),
+            components: Arc::new(Mutex::new(Vec::new())),
+            pairing: Arc::new(Mutex::new(None)),
+            beoremote: Arc::new(Mutex::new(None)),
             started: Instant::now(),
         }
+    }
+
+    /// Hand a source its own writer, creating (or resetting) its entry.
+    pub fn source_handle(&self, client_id: &str, input: Option<String>) -> SourceHandle {
+        if let Ok(mut sources) = self.sources.lock() {
+            sources.insert(client_id.to_string(), SourceSnapshot::new(input));
+        }
+        SourceHandle {
+            client_id: client_id.to_string(),
+            sources: Arc::clone(&self.sources),
+        }
+    }
+
+    pub fn retain_sources(&self, wanted: &[String]) {
+        if let Ok(mut sources) = self.sources.lock() {
+            sources.retain(|client_id, _| wanted.iter().any(|id| id == client_id));
+        }
+    }
+
+    pub fn source_reports(&self) -> Vec<SourceStatusReport> {
+        let Ok(sources) = self.sources.lock() else {
+            return Vec::new();
+        };
+        let mut reports: Vec<SourceStatusReport> = sources
+            .iter()
+            .map(|(client_id, snapshot)| SourceStatusReport {
+                client_id: client_id.clone(),
+                state: snapshot.state.clone(),
+                input: snapshot.input.clone(),
+                codec: snapshot.codec.clone(),
+                sample_rate: snapshot.sample_rate,
+                bit_depth: snapshot.bit_depth,
+                channels: snapshot.channels,
+                level: snapshot.level,
+                signal: snapshot.signal.clone(),
+                clock_rtt_ms: snapshot.clock_rtt_ms,
+                last_error: snapshot.last_error.clone(),
+            })
+            .collect();
+        reports.sort_by(|a, b| a.client_id.cmp(&b.client_id));
+        reports
+    }
+
+    /// Replace the component report. Written after every install/removal attempt.
+    pub fn set_components(&self, components: Vec<ComponentStatus>) {
+        if let Ok(mut slot) = self.components.lock() {
+            *slot = components;
+        }
+    }
+
+    pub fn components(&self) -> Vec<ComponentStatus> {
+        self.components
+            .lock()
+            .map(|slot| slot.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn set_pairing(&self, report: Option<PairingStatusReport>) {
+        if let Ok(mut slot) = self.pairing.lock() {
+            *slot = report;
+        }
+    }
+
+    pub fn pairing(&self) -> Option<PairingStatusReport> {
+        self.pairing.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn set_beoremote(&self, report: Option<BeoremoteStatusReport>) {
+        if let Ok(mut slot) = self.beoremote.lock() {
+            *slot = report;
+        }
+    }
+
+    pub fn beoremote(&self) -> Option<BeoremoteStatusReport> {
+        self.beoremote.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Whether B&O's key socket has a peer. Its own setter because it changes on its own schedule --
+    /// bluetoothd connects when a remote does, which has nothing to do with the menu.
+    pub fn set_beoremote_hid(&self, connected: bool) {
+        if let Ok(mut slot) = self.beoremote.lock() {
+            if let Some(report) = slot.as_mut() {
+                report.hid_connected = connected;
+            }
+        }
+    }
+
+    /// The volume a player is at right now, as last reported by its own task. The one authority for
+    /// "what is it now": the server can change it live, so the supervisor's copy of the config is
+    /// not it.
+    pub fn player_volume(&self, client_id: &str) -> Option<(u8, bool)> {
+        let players = self.players.lock().ok()?;
+        players
+            .get(client_id)
+            .map(|snapshot| (snapshot.volume, snapshot.muted))
+    }
+
+    /// Client ids of the players currently registered, in report order.
+    pub fn player_ids(&self) -> Vec<String> {
+        self.reports()
+            .into_iter()
+            .map(|report| report.client_id)
+            .collect()
     }
 
     /// Hand a player its own writer, creating (or resetting) its entry.
@@ -124,16 +270,25 @@ impl Registry {
     /// Device-level roll-up. Playing wins over connected, and an error only shows when nothing else
     /// is working -- a device with one dead card and one playing room is not "in error".
     pub fn device_state(&self) -> String {
-        let reports = self.reports();
-        if reports.is_empty() {
+        let mut states: Vec<String> = self
+            .reports()
+            .into_iter()
+            .map(|report| report.state)
+            .collect();
+        states.extend(
+            self.source_reports()
+                .into_iter()
+                .map(|report| report.state),
+        );
+        if states.is_empty() {
             return STATE_IDLE.to_string();
         }
         for state in [STATE_STREAMING, STATE_CONNECTED, STATE_CONNECTING] {
-            if reports.iter().any(|report| report.state == state) {
+            if states.iter().any(|current| current == state) {
                 return state.to_string();
             }
         }
-        if reports.iter().all(|report| report.state == STATE_ERROR) {
+        if states.iter().all(|current| current == STATE_ERROR) {
             return STATE_ERROR.to_string();
         }
         STATE_IDLE.to_string()
@@ -220,6 +375,66 @@ impl PlayerHandle {
             snapshot.clock_rtt_ms = rtt_ms;
             snapshot.clock_quality = quality;
         });
+    }
+}
+
+/// Writer for one source's row in the registry.
+#[derive(Clone)]
+pub struct SourceHandle {
+    client_id: String,
+    sources: SharedSources,
+}
+
+impl SourceHandle {
+    fn update(&self, apply: impl FnOnce(&mut SourceSnapshot)) {
+        if let Ok(mut sources) = self.sources.lock() {
+            if let Some(snapshot) = sources.get_mut(&self.client_id) {
+                apply(snapshot);
+            }
+        }
+    }
+
+    pub fn set_state(&self, state: &str) {
+        self.update(|snapshot| snapshot.state = state.to_string());
+    }
+
+    pub fn set_state_ok(&self, state: &str) {
+        self.update(|snapshot| {
+            snapshot.state = state.to_string();
+            snapshot.last_error = None;
+        });
+    }
+
+    pub fn set_error(&self, message: impl Into<String>) {
+        let message = message.into();
+        self.update(|snapshot| {
+            snapshot.state = STATE_ERROR.to_string();
+            snapshot.last_error = Some(message);
+        });
+    }
+
+    pub fn set_format(&self, codec: &str, sample_rate: u32, bit_depth: u8, channels: u16) {
+        self.update(|snapshot| {
+            snapshot.codec = Some(codec.to_string());
+            snapshot.sample_rate = Some(sample_rate);
+            snapshot.bit_depth = Some(bit_depth);
+            snapshot.channels = Some(channels);
+        });
+    }
+
+    pub fn set_level(&self, level: f32) {
+        self.update(|snapshot| snapshot.level = Some(level));
+    }
+
+    pub fn set_signal(&self, level: f32, signal: &str) {
+        self.update(|snapshot| {
+            snapshot.level = Some(level);
+            snapshot.signal = Some(signal.to_string());
+        });
+    }
+
+    pub fn set_clock(&self, rtt_ms: Option<f64>) {
+        self.update(|snapshot| snapshot.clock_rtt_ms = rtt_ms);
     }
 }
 

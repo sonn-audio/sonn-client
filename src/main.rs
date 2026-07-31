@@ -7,6 +7,8 @@
 //! management API in `docs/PROTOCOL.md` is for -- the device reports its sound cards, the server picks
 //! one, and no one has to SSH into a Pi to change a setting.
 
+mod beoremote;
+mod components;
 mod config;
 mod devices;
 mod discovery;
@@ -15,8 +17,10 @@ mod hooks;
 mod identity;
 mod install;
 mod models;
+mod pairing;
 mod player;
 mod server_api;
+mod source;
 mod status;
 mod supervisor;
 
@@ -29,9 +33,11 @@ use tracing::{info, warn};
 
 use crate::discovery::DiscoveredServer;
 use crate::models::{
-    ClientCapabilities, ClientRegisterRequest, ClientStatusRequest, DesiredConfig, OutputDeviceInfo,
+    ClientCapabilities, ClientRegisterRequest, ClientStatusRequest, DesiredConfig, DeviceCommand,
+    OutputDeviceInfo,
 };
 use crate::server_api::ServerApi;
+use crate::supervisor::SupervisorContext;
 
 const DEFAULT_POLL_MS: u64 = 5_000;
 const MIN_POLL_MS: u64 = 1_000;
@@ -41,10 +47,12 @@ const MAX_STATUS_FAILURES: u32 = 3;
 const REGISTER_ATTEMPTS: u32 = 3;
 /// Players one device can run at once, one per sound card. A build limit, not a licence.
 const MAX_PLAYERS: u8 = 4;
+/// Named extras this build ships, so the server can offer the matching configuration.
+const FEATURES: [&str; 3] = ["source", "beoremote", "components"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (command, log_level) = parse_args()?;
+    let (command, argument, log_level) = parse_args()?;
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
             log_level.unwrap_or_else(|| "off".to_string()),
@@ -60,8 +68,19 @@ async fn main() -> Result<()> {
             println!("sonn-client {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some("devices") => devices::print_output_devices(),
+        Some("devices") => devices::print_devices(),
         Some("install") => install::run_install().await,
+        Some("pair-remote") => run_pair_remote(argument).await,
+        Some("components") => {
+            let status = components::inspect_bluetoothd();
+            println!(
+                "{}: {} ({})",
+                status.name,
+                status.state,
+                status.version.as_deref().unwrap_or("no version recorded")
+            );
+            Ok(())
+        }
         Some("run") | None => run().await,
         _ => {
             print_usage();
@@ -105,7 +124,14 @@ async fn run() -> Result<()> {
             warn!("could not enumerate audio outputs: {:#}", err);
             Vec::new()
         });
-        let request = build_register_request(&config, &identity, &outputs);
+        let inputs = devices::list_input_devices().unwrap_or_else(|err| {
+            warn!("could not enumerate audio inputs: {:#}", err);
+            Vec::new()
+        });
+        // Reported at registration so the server knows up front whether the B&O features can be
+        // offered on this device, without asking for an install to find out.
+        statuses.set_components(vec![components::inspect_bluetoothd()]);
+        let request = build_register_request(&config, &identity, &outputs, &inputs, &statuses);
         let Some(desired) = register(&api, &request).await else {
             tokio::time::sleep(Duration::from_secs(10)).await;
             continue;
@@ -125,14 +151,18 @@ async fn run() -> Result<()> {
             desired_tx,
             stop_tx,
             outputs,
+            inputs,
         ));
 
         // Returns when the poller gives up on this server (or its sender is dropped), having first
-        // stopped every player it started.
+        // stopped every player, source and bridge it started.
         supervisor::run(
             desired_rx,
-            statuses.clone(),
-            config.volume_hook.clone(),
+            SupervisorContext {
+                statuses: statuses.clone(),
+                fallback_volume_hook: config.volume_hook.clone(),
+                server_base_url: api.base_url().to_string(),
+            },
             stop_rx,
         )
         .await;
@@ -215,6 +245,7 @@ async fn register(api: &ServerApi, request: &ClientRegisterRequest) -> Option<De
 
 /// Report what we are doing, receive what we should be doing. Every reply is the full desired state,
 /// so a change made in the UI takes effect one poll later without the server reaching back in.
+#[allow(clippy::too_many_arguments)]
 async fn status_loop(
     api: ServerApi,
     device_id: String,
@@ -223,8 +254,10 @@ async fn status_loop(
     desired_tx: watch::Sender<DesiredConfig>,
     stop_tx: watch::Sender<bool>,
     initial_outputs: Vec<OutputDeviceInfo>,
+    initial_inputs: Vec<OutputDeviceInfo>,
 ) {
     let mut reported_outputs = hash_outputs(&initial_outputs);
+    let mut reported_inputs = hash_outputs(&initial_inputs);
     let mut failures = 0u32;
     let mut interval = Duration::from_millis(DEFAULT_POLL_MS);
 
@@ -233,22 +266,35 @@ async fn status_loop(
 
         let outputs = devices::list_output_devices().unwrap_or_default();
         let outputs_hash = hash_outputs(&outputs);
+        let inputs = devices::list_input_devices().unwrap_or_default();
+        let inputs_hash = hash_outputs(&inputs);
         let request = ClientStatusRequest {
             state: statuses.device_state(),
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_s: statuses.uptime().as_secs(),
             players: statuses.reports(),
+            sources: statuses.source_reports(),
             // Only when the set changed: a USB DAC plugged in after boot has to appear in the
             // picker, and repeating an unchanged list on every poll is noise.
             outputs: (outputs_hash != reported_outputs).then(|| outputs.clone()),
+            inputs: (inputs_hash != reported_inputs).then(|| inputs.clone()),
+            components: statuses.components(),
+            pairing: statuses.pairing(),
+            beoremote: statuses.beoremote(),
         };
 
         match api.post_status(&device_id, &request).await {
             Ok(desired) => {
                 failures = 0;
                 reported_outputs = outputs_hash;
+                reported_inputs = inputs_hash;
                 interval = poll_interval(&desired);
                 for command in &desired.commands {
+                    // Built-ins first: a command this client can carry out itself should not need a
+                    // script on the device to be useful.
+                    if handle_builtin_command(command, &statuses).await {
+                        continue;
+                    }
                     hooks.command(&command.command, &command.args).await;
                 }
                 if desired_tx.send(desired).is_err() {
@@ -283,6 +329,8 @@ fn build_register_request(
     config: &config::Config,
     identity: &identity::DeviceIdentity,
     outputs: &[OutputDeviceInfo],
+    inputs: &[OutputDeviceInfo],
+    statuses: &status::Registry,
 ) -> ClientRegisterRequest {
     ClientRegisterRequest {
         device_id: config.device_id.clone(),
@@ -294,14 +342,38 @@ fn build_register_request(
         model: identity.model.clone(),
         os: identity.os.clone(),
         outputs: outputs.to_vec(),
+        inputs: inputs.to_vec(),
         capabilities: ClientCapabilities {
             codecs: player::SUPPORTED_CODECS
                 .iter()
                 .map(|codec| codec.to_string())
                 .collect(),
             max_players: MAX_PLAYERS,
-            features: Vec::new(),
+            features: FEATURES.iter().map(|entry| entry.to_string()).collect(),
         },
+        components: statuses.components(),
+    }
+}
+
+/// Commands this client carries out itself, rather than handing to a script.
+///
+/// Returns true when it was one of ours. Pairing is the case that matters: it is the one thing a user
+/// would otherwise need a terminal for, and the server can offer it as a button instead.
+async fn handle_builtin_command(command: &DeviceCommand, statuses: &status::Registry) -> bool {
+    match command.command.as_str() {
+        "pair_remote" => {
+            let address = command.args.first().cloned();
+            let statuses = statuses.clone();
+            // Spawned: the pairing window is up to 90 seconds and the status loop has to keep
+            // reporting while it is open -- that report is how the UI shows progress.
+            tokio::spawn(async move {
+                if let Err(err) = pairing::pair_remote(&statuses, address, None).await {
+                    warn!("pairing failed to start: {:#}", err);
+                }
+            });
+            true
+        }
+        _ => false,
     }
 }
 
@@ -340,11 +412,39 @@ fn spawn_shutdown_handler(hooks: Arc<hooks::HookRunner>) {
     });
 }
 
+/// `sonn-client pair-remote [address]`, for pairing a Beoremote One by hand. The same flow the server
+/// triggers with a `pair_remote` command, so the button in the UI and the command line cannot drift.
+async fn run_pair_remote(address: Option<String>) -> Result<()> {
+    let statuses = status::Registry::new();
+    println!("Put the remote into pairing mode now.");
+    pairing::pair_remote(&statuses, address, None).await?;
+    match statuses.pairing() {
+        Some(report) => {
+            println!(
+                "{}{}{}",
+                report.state,
+                report
+                    .address
+                    .map(|address| format!(" {}", address))
+                    .unwrap_or_default(),
+                report
+                    .message
+                    .map(|message| format!(" -- {}", message))
+                    .unwrap_or_default()
+            );
+        }
+        None => println!("nothing to report"),
+    }
+    Ok(())
+}
+
 fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  sonn-client [--log-level <level>] [run]");
     eprintln!("  sonn-client install");
     eprintln!("  sonn-client devices");
+    eprintln!("  sonn-client pair-remote [address]");
+    eprintln!("  sonn-client components");
     eprintln!("  sonn-client --help");
     eprintln!("  sonn-client --version");
     eprintln!();
@@ -354,11 +454,13 @@ fn print_usage() {
     eprintln!("  sudo sonn-client install         # write the systemd unit and start the service");
     eprintln!("  sonn-client devices              # list the sound cards the server will be offered");
     eprintln!("  sonn-client --log-level info run # run in the foreground with logs");
+    eprintln!("  sudo sonn-client pair-remote     # pair a Beoremote One without a terminal dance");
 }
 
-fn parse_args() -> Result<(Option<String>, Option<String>)> {
+fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
     let mut args = std::env::args().skip(1);
     let mut command = None;
+    let mut argument = None;
     let mut log_level = None;
 
     while let Some(arg) = args.next() {
@@ -375,8 +477,10 @@ fn parse_args() -> Result<(Option<String>, Option<String>)> {
         }
         if command.is_none() {
             command = Some(arg);
+        } else if argument.is_none() {
+            argument = Some(arg);
         }
     }
 
-    Ok((command, log_level))
+    Ok((command, argument, log_level))
 }

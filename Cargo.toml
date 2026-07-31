@@ -14,15 +14,25 @@ hostname = "0.4"
 mac_address = "1.1"
 mdns-sd = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-sendspin = "0.3"
+# Our fork, for the source@v1 role: capturing a line-in and streaming it to the server is in the
+# spec and in the Python reference client, but not yet in the upstream crate. The patch is a
+# self-contained commit on `feat/source-v1` so it can go upstream as a PR; drop this back to a
+# plain version once it lands.
+sendspin = { git = "https://github.com/sonn-audio/sendspin-rs.git", branch = "feat/source-v1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "net", "time", "sync", "signal", "process"] }
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1.8", features = ["v4"] }
+
+# Working on the fork and this client together: uncomment to build against the checkout next door
+# instead of what is pushed.
+# [patch."https://github.com/sonn-audio/sendspin-rs.git"]
+# sendspin = { path = "../sendspin-rs" }
 
 [profile.release]
 # Speed over size, unlike the line-in bridge: this end of the wire decodes FLAC and feeds a

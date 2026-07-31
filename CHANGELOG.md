@@ -18,5 +18,16 @@ First cut. A Sendspin-only endpoint that is installed with one command and confi
 - Live volume, mute and static delay; reconnect only for changes that need one (card, rate, server).
 - Hardware volume through a hook (`<script> <level>`, 0 for muted), with the software mixer left at
   unity so nothing is attenuated twice.
+- Sendspin **sources**: a capture device streamed to the server as a selectable line-in, with level
+  and line-sense reporting, server-driven start/stop and signal thresholds, and a control hook so a
+  non-network device (a BeoSound 9000 on MasterLink) gets switched on when a zone selects it. Uses the
+  `source@v1` role from our `sendspin-rs` fork.
+- **Beoremote One** support: menus filled from the server, picks and keys forwarded to it, volume
+  applied locally to the player and reported back upstream. Replaces the Python bridge.
+- **Managed components**: fetch, verify and install B&O's patched BlueZ (`beoremote-bluetoothd`) on the
+  server's instruction, including the storage-prefix detection that the reference install script
+  learned the hard way. Kept out of this binary for licence and size reasons.
+- `pair-remote`: a pairing window (scan, pair, trust, connect) driven by a device command or by hand,
+  so adding a remote needs no terminal.
 - `install` (systemd unit), `devices` (list sound cards) and a status snapshot at
   `/tmp/sonn-client.status.json`.
