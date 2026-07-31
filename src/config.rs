@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::warn;
 
 const CONFIG_DIR_SYSTEM: &str = "/etc/sonn-client";
 const CONFIG_DIR_FALLBACK: &str = ".config/sonn-client";
@@ -86,11 +87,17 @@ pub fn write_config(config: &Config) -> Result<PathBuf> {
 }
 
 pub fn load_or_create_config() -> Result<(Config, PathBuf)> {
+    // Salvaged from a file we could not parse, so an unrelated typo does not re-identify the device.
+    let mut rescued_device_id: Option<String> = None;
+
     let preferred = preferred_config_path();
     if preferred.exists() {
         match load_config_file(&preferred) {
             Ok(config) => return Ok((config, preferred)),
-            Err(err) => backup_invalid_config(&preferred, &err)?,
+            Err(err) => {
+                rescued_device_id = rescue_device_id(&preferred);
+                backup_invalid_config(&preferred, &err)?;
+            }
         }
     }
 
@@ -98,12 +105,15 @@ pub fn load_or_create_config() -> Result<(Config, PathBuf)> {
     if fallback.exists() {
         match load_config_file(&fallback) {
             Ok(config) => return Ok((config, fallback)),
-            Err(err) => backup_invalid_config(&fallback, &err)?,
+            Err(err) => {
+                rescued_device_id = rescued_device_id.or_else(|| rescue_device_id(&fallback));
+                backup_invalid_config(&fallback, &err)?;
+            }
         }
     }
 
     let config = Config {
-        device_id: default_device_id(),
+        device_id: rescued_device_id.unwrap_or_else(default_device_id),
         preferred_server_name: None,
         preferred_server_mac: None,
         server_url: None,
@@ -146,8 +156,37 @@ fn load_config_file(path: &Path) -> Result<Config> {
     toml::from_str(&data).with_context(|| format!("parse {}", path.display()))
 }
 
+/// Recover the device id from a file that will not parse.
+///
+/// Identity is the one line that must survive a mistake anywhere else in the file: the server knows
+/// this device by it, and every zone pointing here goes quiet the moment it changes. A hand-written
+/// `server_url` without quotes should not silently turn a configured speaker into a stranger.
+///
+/// Deliberately not a TOML parse -- the file is already known not to be one. It looks for the
+/// simplest possible spelling of the line and gives up otherwise.
+fn rescue_device_id(path: &Path) -> Option<String> {
+    let data = fs::read_to_string(path).ok()?;
+    for line in data.lines() {
+        let line = line.trim();
+        let Some(value) = line.strip_prefix("device_id") else {
+            continue;
+        };
+        let value = value.trim_start().strip_prefix('=')?.trim();
+        let value = value
+            .strip_prefix('"')
+            .and_then(|rest| rest.split('"').next())?;
+        if !value.trim().is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
 /// A config we cannot parse is moved aside rather than overwritten: whatever the operator typed is
 /// still there to look at, and the device comes up on a fresh one instead of refusing to start.
+///
+/// Loudly, though. Silently replacing the file is how a mistyped setting becomes "my speaker
+/// disappeared and I have no idea why".
 fn backup_invalid_config(path: &Path, err: &anyhow::Error) -> Result<()> {
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -161,6 +200,13 @@ fn backup_invalid_config(path: &Path, err: &anyhow::Error) -> Result<()> {
                 .and_then(|_| fs::remove_file(path))
         })
         .with_context(|| format!("backup invalid config {}: {}", path.display(), err))?;
+    warn!(
+        "{} could not be read as TOML ({:#}); it has been moved to {} and replaced with a fresh one. \
+         Any setting in it is no longer in effect.",
+        path.display(),
+        err,
+        backup.display()
+    );
     Ok(())
 }
 
@@ -174,6 +220,38 @@ fn try_write(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identity_survives_a_file_that_will_not_parse() {
+        let dir = std::env::temp_dir().join(format!(
+            "sonn-cfg-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("config.toml");
+
+        // What an operator actually types: a value without quotes. TOML rejects the whole file, and
+        // before this the device came back under a new id -- every zone pointing at the old one gone
+        // quiet, with nothing in the log to connect the two.
+        fs::write(
+            &path,
+            "device_id = \"sonn-beosound9000-a01ec20a\"\nserver_url = http://192.168.1.209:7090\n",
+        )
+        .expect("write");
+        assert!(toml::from_str::<Config>(&fs::read_to_string(&path).unwrap()).is_err());
+        assert_eq!(
+            rescue_device_id(&path).as_deref(),
+            Some("sonn-beosound9000-a01ec20a")
+        );
+
+        fs::write(&path, "nothing to see here\n").expect("write");
+        assert_eq!(rescue_device_id(&path), None, "invented ids are worse");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn a_setting_this_build_does_not_know_is_kept_and_named() {

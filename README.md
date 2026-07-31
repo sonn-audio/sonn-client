@@ -62,10 +62,13 @@ sudo sonn-client install          # write the systemd unit, enable and start it
 sonn-client devices               # list the sound cards the server will be offered
 sudo sonn-client pair-remote      # pair a Beoremote One (90s window: scan, pair, trust, connect)
 sonn-client components            # what is installed of the managed software
-sonn-client --log-level info run  # run in the foreground with logs
+sonn-client devices --log-level debug  # ...including the ones left out, and why
+sonn-client --log-level info run       # run in the foreground with logs
 ```
 
-Log levels: `off` (default), `error`, `warn`, `info`, `debug`, `trace`.
+Log levels: `error`, `warn`, `info`, `debug`, `trace`. The service logs at `info`; the one-shot
+commands print their answer and stay quiet. `--log-level` wins over `RUST_LOG`, which wins over both
+defaults.
 
 ```bash
 journalctl -u sonn-client -f     # logs
@@ -87,7 +90,13 @@ first run. See `examples/config.toml`. Fields:
 | `volume_hook`                                | local default hardware-volume hook                     |
 
 A config file that cannot be parsed is moved aside with a timestamp and replaced with a fresh one, so
-a typo cannot stop a speaker from coming back after a reboot.
+a typo cannot stop a speaker from coming back after a reboot. A key this build does not recognise is
+kept and named in the log rather than acted on -- a misspelled setting reads perfectly and does
+nothing, which is the hardest kind of fault to see from the other end of a network.
+
+`preferred_server_name` and `preferred_server_mac` select, they do not suggest: with a preference set,
+no other audioserver is used. The effective choice is logged at startup, so "the setting did not take"
+and "the server is not there" do not look alike.
 
 ## Hardware volume
 
