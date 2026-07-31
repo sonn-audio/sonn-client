@@ -86,16 +86,24 @@ fn list_devices(direction: Direction) -> Vec<OutputDeviceInfo> {
                 Direction::Output => device.supported_output_configs().map(|c| c.collect()),
                 Direction::Input => device.supported_input_configs().map(|c| c.collect()),
             };
+            // A card someone is already playing through. `hw:` devices are exclusive, so this is the
+            // normal state of the very card this client was given -- and dropping it from the listing
+            // makes the server report the speaker it is using as "not currently connected". It is
+            // reported without its formats rather than not at all.
+            let mut in_use = false;
             let configs: Vec<_> = match configs {
                 Ok(configs) => configs,
+                Err(err) if is_busy(&err) => {
+                    debug!("{} is in use; listing it without its formats", id);
+                    in_use = true;
+                    Vec::new()
+                }
                 Err(err) => {
-                    // The interesting case: a card that exists but will not say what it supports,
-                    // usually because something else holds it open.
                     debug!("{} skipped for {}: {}", id, direction.label(), err);
                     continue;
                 }
             };
-            if configs.is_empty() {
+            if configs.is_empty() && !in_use {
                 // Not an error: this is simply a device for the other direction.
                 debug!("{} has no {} configs", id, direction.label());
                 continue;
@@ -166,6 +174,16 @@ fn rank(id: &str) -> u8 {
     } else {
         3
     }
+}
+
+/// Whether an enumeration failure means "in use" rather than "not that kind of device".
+///
+/// Matched on the message because that is where ALSA's `EBUSY` ends up by the time cpal has wrapped
+/// it: the backend-specific error carries the text and nothing structured. Getting this wrong in one
+/// direction lists a card that cannot be used; in the other it hides a card that is working.
+fn is_busy<E: std::fmt::Display>(err: &E) -> bool {
+    let text = err.to_string().to_ascii_lowercase();
+    text.contains("busy") || text.contains("ebusy")
 }
 
 fn is_numeric(token: &str) -> bool {
@@ -343,6 +361,20 @@ mod tests {
             ],
             "the numbers move across reboots; the names do not"
         );
+    }
+
+    #[test]
+    fn a_card_that_is_being_played_through_is_still_a_card() {
+        // ALSA's EBUSY, as cpal hands it over. The card this client was told to use is exclusive
+        // while it plays, so treating "busy" as "gone" makes a working speaker report itself as
+        // missing the next time it reconnects.
+        assert!(is_busy(
+            &"ALSA function 'snd_pcm_open' failed: Device or resource busy"
+        ));
+        assert!(is_busy(&"EBUSY"));
+        // Everything else is a device for the other direction, or no device at all.
+        assert!(!is_busy(&"The dmix plugin supports only playback stream"));
+        assert!(!is_busy(&"No such file or directory"));
     }
 
     #[test]
