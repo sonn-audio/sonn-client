@@ -72,8 +72,14 @@ impl SourceParams {
         }
     }
 
+    /// Frames in one capture chunk.
+    ///
+    /// `frame_ms` comes from the server, so it is clamped rather than trusted: this number sizes
+    /// every buffer downstream, and `usize` is 32 bits on armv7, where a wild value would wrap
+    /// instead of merely being silly. A second per chunk is already far past useful for a real-time
+    /// capture, and with that bound the product of a `u32` rate and the clamp cannot leave `u32`.
     fn frames_per_chunk(&self) -> usize {
-        let frames = self.sample_rate as u64 * self.frame_ms.max(1) / 1000;
+        let frames = u64::from(self.sample_rate) * self.frame_ms.clamp(1, 1_000) / 1_000;
         frames.max(1) as usize
     }
 
@@ -573,6 +579,32 @@ mod tests {
 
     fn pcm16(samples: &[i16]) -> Vec<u8> {
         samples.iter().flat_map(|s| s.to_le_bytes()).collect()
+    }
+
+    fn params(sample_rate: u32, frame_ms: u64) -> SourceParams {
+        SourceParams {
+            url: "ws://server/sendspin".to_string(),
+            client_id: "test".to_string(),
+            name: "Line in".to_string(),
+            input: None,
+            sample_rate,
+            channels: DEFAULT_CHANNELS,
+            bit_depth: DEFAULT_BIT_DEPTH,
+            frame_ms,
+            controls: Vec::new(),
+            always_on: false,
+        }
+    }
+
+    #[test]
+    fn a_chunk_stays_a_chunk_whatever_the_server_asks_for() {
+        assert_eq!(params(48_000, 20).frames_per_chunk(), 960);
+
+        // Both of these are the server misconfigured, not an attack, but they size buffers -- and on
+        // a 32-bit Pi the unclamped product would wrap into a plausible-looking small number rather
+        // than fail loudly.
+        assert_eq!(params(48_000, 0).frames_per_chunk(), 48);
+        assert_eq!(params(48_000, u64::MAX).frames_per_chunk(), 48_000);
     }
 
     #[test]
