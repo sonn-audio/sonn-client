@@ -1770,6 +1770,7 @@ dependencies = [
 name = "sonn-client"
 version = "1.0.3"
 dependencies = [
+ "alsa-sys",
  "anyhow",
  "base64",
  "cpal",

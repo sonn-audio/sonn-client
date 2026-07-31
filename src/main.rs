@@ -7,6 +7,7 @@
 //! management API in `docs/PROTOCOL.md` is for -- the device reports its sound cards, the server picks
 //! one, and no one has to SSH into a Pi to change a setting.
 
+mod alsa_quiet;
 mod beoremote;
 mod components;
 mod config;
@@ -25,9 +26,11 @@ mod status;
 mod supervisor;
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
+use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -47,6 +50,11 @@ const MAX_STATUS_FAILURES: u32 = 3;
 const REGISTER_ATTEMPTS: u32 = 3;
 /// Players one device can run at once, one per sound card. A build limit, not a licence.
 const MAX_PLAYERS: u8 = 4;
+/// How long a server that has no client API is left alone. Long enough that it stops filling the
+/// journal, short enough that upgrading that server does not need a visit to the device.
+const DECLINED_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
+/// Pause when every audioserver on the network has declined, so the search does not become a poll.
+const DISCOVERY_BACKOFF: Duration = Duration::from_secs(60);
 /// Named extras this build ships, so the server can offer the matching configuration.
 const FEATURES: [&str; 3] = ["source", "beoremote", "components"];
 
@@ -59,6 +67,7 @@ async fn main() -> Result<()> {
             log_level,
         )))
         .init();
+    alsa_quiet::install();
 
     match command.as_deref() {
         Some("--help") | Some("-h") => {
@@ -107,11 +116,18 @@ async fn run() -> Result<()> {
     let statuses = status::Registry::new();
     health::spawn(statuses.clone());
     spawn_shutdown_handler(Arc::clone(&hooks));
+    // Said out loud at startup, because the alternative is reading a log full of the wrong server and
+    // having no way to tell whether the config was even picked up.
+    info!("{}", describe_server_preference(&config));
+
+    // Servers that answered "no such endpoint", and when. Cleared by a restart, which is the same
+    // moment someone would have upgraded the server they were expecting to use.
+    let mut declined: HashMap<String, Instant> = HashMap::new();
 
     // Outer loop: attach to a server, run until contact is lost, start over. A server that is
     // rebooted, renamed or moved to another address needs no help from anyone here.
     loop {
-        let server = resolve_server(&config).await;
+        let server = resolve_server(&config, &declined).await;
         let api = ServerApi::new(&server.base_url, &server.register_path, &server.status_path)?;
         info!("attaching to {}", api.base_url());
 
@@ -129,9 +145,21 @@ async fn run() -> Result<()> {
         // offered on this device, without asking for an install to find out.
         statuses.set_components(vec![components::inspect_bluetoothd()]);
         let request = build_register_request(&config, &identity, &outputs, &inputs, &statuses);
-        let Some(desired) = register(&api, &request).await else {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            continue;
+        let desired = match register(&api, &request).await {
+            Registration::Accepted(desired) => *desired,
+            Registration::NotSupported => {
+                declined.insert(api.base_url().to_string(), Instant::now());
+                // A pinned server is not skipped and discovery is not run, so nothing else would
+                // slow this loop down. Wait before asking the same server the same question.
+                if is_pinned(&config) {
+                    tokio::time::sleep(DISCOVERY_BACKOFF).await;
+                }
+                continue;
+            }
+            Registration::Unreachable => {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                continue;
+            }
         };
 
         hooks
@@ -175,13 +203,22 @@ async fn run() -> Result<()> {
 
 /// A server pinned in config.toml, or whatever mDNS turns up. Never gives up: a device that boots
 /// before the network is a normal event.
-async fn resolve_server(config: &config::Config) -> DiscoveredServer {
+///
+/// `declined` holds the servers that answered "no such endpoint". They are skipped while that answer
+/// is still fresh, so a network with two audioservers -- one upgraded, one not -- settles on the one
+/// that can actually use this device instead of retrying the other every few seconds forever.
+async fn resolve_server(
+    config: &config::Config,
+    declined: &HashMap<String, Instant>,
+) -> DiscoveredServer {
     if let Some(url) = config
         .server_url
         .as_deref()
         .map(str::trim)
         .filter(|url| !url.is_empty())
     {
+        // A pinned server is never skipped: there is nothing else to fall back to, and the operator
+        // gets to see it keep trying rather than have the device quietly give up on their choice.
         return DiscoveredServer::from_base_url(url);
     }
 
@@ -191,13 +228,32 @@ async fn resolve_server(config: &config::Config) -> DiscoveredServer {
         // Discovery blocks for up to 8 seconds waiting for mDNS answers, so it does not belong on an
         // async worker.
         let discovered = tokio::task::spawn_blocking(move || {
-            discovery::discover_server(preferred_name.as_deref(), preferred_mac.as_deref())
+            discovery::discover_servers(preferred_name.as_deref(), preferred_mac.as_deref())
         })
         .await;
         match discovered {
-            Ok(Ok(server)) => {
-                info!("discovered {} at {}", server.instance_name, server.base_url);
-                return server;
+            Ok(Ok(servers)) => {
+                let fresh: Vec<DiscoveredServer> = servers
+                    .iter()
+                    .filter(|server| match declined.get(&server.base_url) {
+                        Some(when) => when.elapsed() >= DECLINED_RETRY_AFTER,
+                        None => true,
+                    })
+                    .cloned()
+                    .collect();
+                if let Some(server) = fresh.into_iter().next() {
+                    info!("discovered {} at {}", server.instance_name, server.base_url);
+                    return server;
+                }
+                if !servers.is_empty() {
+                    warn!(
+                        "the {} audioserver(s) found do not support Sonn clients; waiting {} minutes before asking again",
+                        servers.len(),
+                        DECLINED_RETRY_AFTER.as_secs() / 60
+                    );
+                    tokio::time::sleep(DISCOVERY_BACKOFF).await;
+                    continue;
+                }
             }
             Ok(Err(err)) => warn!("mDNS discovery found nothing: {:#}", err),
             Err(err) => warn!("discovery task failed: {}", err),
@@ -206,7 +262,16 @@ async fn resolve_server(config: &config::Config) -> DiscoveredServer {
     }
 }
 
-async fn register(api: &ServerApi, request: &ClientRegisterRequest) -> Option<DesiredConfig> {
+/// What a server had to say when this device introduced itself.
+enum Registration {
+    Accepted(Box<DesiredConfig>),
+    /// The server answered, but has no client API. Retrying changes nothing.
+    NotSupported,
+    /// Nobody answered, or answered badly. Worth trying again.
+    Unreachable,
+}
+
+async fn register(api: &ServerApi, request: &ClientRegisterRequest) -> Registration {
     for attempt in 1..=REGISTER_ATTEMPTS {
         match api.register(request).await {
             Ok(desired) => {
@@ -216,28 +281,28 @@ async fn register(api: &ServerApi, request: &ClientRegisterRequest) -> Option<De
                     request.outputs.len(),
                     desired.players.len()
                 );
-                return Some(desired);
+                return Registration::Accepted(Box::new(desired));
             }
             Err(err) => {
                 let detail = format!("{:#}", err);
                 if detail.contains("404") {
-                    // Worth calling out: everything else about the server looks fine, it just does
-                    // not have the client API yet.
+                    // A settled answer, not a hiccup: this server is running a build without the
+                    // client API. Asking it four more times only fills the journal.
                     warn!(
-                        "registration rejected with 404 -- this audioserver may not support Sonn clients yet: {}",
-                        detail
+                        "{} does not support Sonn clients (404); looking for another audioserver",
+                        api.base_url()
                     );
-                } else {
-                    warn!(
-                        "registration attempt {}/{} failed: {}",
-                        attempt, REGISTER_ATTEMPTS, detail
-                    );
+                    return Registration::NotSupported;
                 }
+                warn!(
+                    "registration attempt {}/{} failed: {}",
+                    attempt, REGISTER_ATTEMPTS, detail
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
-    None
+    Registration::Unreachable
 }
 
 /// Report what we are doing, receive what we should be doing. Every reply is the full desired state,
@@ -458,6 +523,35 @@ fn print_usage() {
     eprintln!("  sudo sonn-client pair-remote     # pair a Beoremote One without a terminal dance");
 }
 
+fn is_pinned(config: &config::Config) -> bool {
+    config
+        .server_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty())
+}
+
+/// Which server this device will attach to, in the words of the config that decided it.
+fn describe_server_preference(config: &config::Config) -> String {
+    let set = |value: &Option<String>| {
+        value
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(url) = set(&config.server_url) {
+        return format!("pinned to {} (server_url); mDNS discovery is skipped", url);
+    }
+    if let Some(mac) = set(&config.preferred_server_mac) {
+        return format!("looking for the audioserver with mac {} and no other", mac);
+    }
+    if let Some(name) = set(&config.preferred_server_name) {
+        return format!("looking for the audioserver named {:?} and no other", name);
+    }
+    "no server pinned; attaching to whichever audioserver mDNS finds first".to_string()
+}
+
 /// What to log when nobody said.
 ///
 /// The service is the whole point of this program and it runs unattended, so it logs at `info` by
@@ -513,6 +607,33 @@ fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_configured_server_is_stated_in_plain_words() {
+        let mut config = config::Config {
+            device_id: "test".to_string(),
+            preferred_server_name: None,
+            preferred_server_mac: None,
+            server_url: None,
+            on_connect: None,
+            on_command: None,
+            volume_hook: None,
+        };
+        assert!(describe_server_preference(&config).contains("no server pinned"));
+
+        // Whitespace-only counts as unset, the same way the resolver treats it -- otherwise the log
+        // would claim a pin that nothing honours.
+        config.preferred_server_name = Some("   ".to_string());
+        assert!(describe_server_preference(&config).contains("no server pinned"));
+
+        config.preferred_server_name = Some("Test Audioserver".to_string());
+        assert!(describe_server_preference(&config).contains("Test Audioserver"));
+
+        config.server_url = Some("http://192.168.1.209:7090".to_string());
+        let stated = describe_server_preference(&config);
+        assert!(stated.contains("192.168.1.209"), "the url wins: {stated}");
+        assert!(is_pinned(&config));
+    }
 
     #[test]
     fn the_service_logs_and_the_one_shot_commands_do_not() {

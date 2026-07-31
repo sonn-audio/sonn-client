@@ -38,6 +38,11 @@ uuid = { version = "1.8", features = ["v4"] }
 # [patch."https://github.com/sonn-audio/sendspin-rs.git"]
 # sendspin = { path = "../sendspin-rs" }
 
+# Only to silence libasound's own stderr output (see src/alsa_quiet.rs). cpal already pulls this
+# in on Linux, so it costs nothing but the line.
+[target.'cfg(target_os = "linux")'.dependencies]
+alsa-sys = "0.4"
+
 [profile.release]
 # Speed over size, unlike the line-in bridge: this end of the wire decodes FLAC and feeds a
 # real-time callback, so `opt-level = "z"` would be paid for in dropouts on a Pi Zero.
