@@ -1,3 +1,10 @@
+## [1.0.2](https://github.com/sonn-audio/sonn-client/compare/v1.0.1...v1.0.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* **source:** bound the chunk size the server asks for ([3bd5e91](https://github.com/sonn-audio/sonn-client/commit/3bd5e9132b95f1a5e419d36e835dc0c7c76b3ad6))
+
 ## [1.0.1](https://github.com/sonn-audio/sonn-client/compare/v1.0.0...v1.0.1) (2026-07-31)
 
 
