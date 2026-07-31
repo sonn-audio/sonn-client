@@ -1,3 +1,10 @@
+## [1.0.3](https://github.com/sonn-audio/sonn-client/compare/v1.0.2...v1.0.3) (2026-07-31)
+
+
+### Bug Fixes
+
+* let the service say what it is doing ([399cbe0](https://github.com/sonn-audio/sonn-client/commit/399cbe0e345ec7de3878ac85eef930f1c10a1901))
+
 ## [1.0.2](https://github.com/sonn-audio/sonn-client/compare/v1.0.1...v1.0.2) (2026-07-31)
 
 
