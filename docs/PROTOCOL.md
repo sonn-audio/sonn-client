@@ -24,8 +24,8 @@ its endpoint paths from TXT records:
 | TXT key           | Default                              | Meaning                        |
 | ----------------- | ------------------------------------ | ------------------------------ |
 | `api`             | `/api`                               | API root, already advertised   |
-| `client_register` | `{api}/clients/register`             | register endpoint              |
-| `client_status`   | `{api}/clients/{device_id}/status`   | status endpoint, `{device_id}` substituted |
+| `client_register` | `{api}/sonnclients/register`         | register endpoint              |
+| `client_status`   | `{api}/sonnclients/{device_id}/status` | status endpoint, `{device_id}` substituted |
 | `mac`             | —                                    | already advertised; used by `preferred_server_mac` |
 
 Both paths have defaults, so a server that adds nothing to its TXT records still works. Adding them
@@ -50,6 +50,7 @@ replies with the desired state.
   "mac": "DC:A6:32:1B:44:90",
   "model": "Raspberry Pi 4 Model B Rev 1.4",
   "os": "Debian GNU/Linux 12 (bookworm) aarch64",
+  "arch": "aarch64",
   "outputs": [
     {
       "id": "hw:CARD=DAC,DEV=0",
@@ -217,6 +218,7 @@ broken.
       "enabled": true
     }
   ],
+  // one artifact, already chosen for this device's `arch`
   "commands": []
 }
 ```
@@ -343,36 +345,36 @@ works once and then looks dead.
 It is driven through `bluetoothctl` rather than D-Bus on purpose: bluetoothd refuses to pair without
 an *agent* registered to answer its questions, and `bluetoothctl` brings one.
 
-## What the server side needs (not yet built)
+## The server side
 
-The client is complete against this contract; the server end is not. In the audioserver repo:
+Built, in the audioserver repo:
 
-1. **`src/adapters/discovery/sonnCoreMdnsService.ts`** — add the two TXT keys next to the existing
-   `linein_*` ones.
-2. **A device-facing handler**, alongside `src/adapters/http/lineInApi/lineInApiHandler.ts`, matching
-   `/api/clients`. Same shape as the line-in bridge registry: keep a `Map<deviceId, record>` of the
-   last registration plus the last status, with a staleness window so a device that stops polling
-   shows as offline. Route it in `httpService.ts` where `lineInApi.matches(pathname)` is handled.
-3. **Config** — the desired state has to come from somewhere persistent: per device, a name and a
-   list of players (client_id, output id, delay, volume mode). The natural home is a `sonnClients`
-   section in the config, with `sendspin_url` derived from the server's own http host/port rather
-   than stored.
-4. **Admin API + UI** — `GET /admin/api/clients` returning registration + status + the configured
-   players, and a view where the sound-card list from `outputs` becomes a picker. Zones need no
-   change at all: a Sonn client is an ordinary Sendspin output, so once a `client_id` exists it can
-   be assigned as a zone output or as a satellite exactly like any other.
-5. **The zone-side link** — when a player is assigned to a zone, the zone's sendspin output config
-   points at that `client_id`. Nothing else to wire: the client dials the server, so it appears in
-   `sendspinCore.listClients()` and in `GET /transports/sendspin/clients` on its own.
-6. **Sources** need no new server code either: `SendspinLineInService` already maps a line-in input
-   whose `source.type` is `sendspin` to a client id, and consumes type-12 frames. What the admin UI
-   needs is the capture-device picker fed from `inputs`, and a way to set the same `client_id` on both
-   sides.
-7. **Beoremote** is already served by `/api/beoremote/zones/{zone}/…`; what is missing is somewhere in
-   the UI to say *which zone* a device's remote drives, which is the `beoremote` block above.
-8. **Component hosting** — somewhere to serve the `beoremote-bluetoothd` tarballs with a sha256. A
-   release of `beoremote-linux` per architecture is the obvious home; the server only needs to hand
-   out the URL.
+- **`POST /api/sonnclients/register`** and **`POST /api/sonnclients/{device_id}/status`** in
+  `src/adapters/http/sonnClientApi/sonnClientApiHandler.ts`. Ungated, like `/api/linein`: a speaker
+  has no admin session. A device that registers is written into the config on first sight — identity
+  only — so it appears in the admin UI as something waiting to be given a room.
+- **Desired state** assembled from `config.sonnClients.devices[]` on every reply. `sendspin_url` is
+  built from the request's own Host header, because that is by definition an address the device just
+  reached the server on; a reconstructed `host:port` is a guess, and on a multi-homed machine usually
+  the wrong one.
+- **`client_register` / `client_status`** TXT records on `_sonncore._tcp`, so the paths can move
+  without a release on every speaker.
+- **Admin API** under `/admin/api/sonnclients`: list, read one, `PUT` a device's configuration,
+  `DELETE` to forget it, and `POST …/commands` to queue `pair_remote`. A `DELETE` is refused with 409
+  while any zone output, satellite or line-in input still points at one of the device's client ids —
+  forgetting it would leave that room silent with nothing to explain why.
+- **Components** are resolved server-side: the catalogue in `config.sonnClients.components[]` holds a
+  URL and sha256 per architecture, and the device is handed the one matching the `arch` it reported.
+  An entry with no artifact for that architecture is left out rather than sent without a URL.
+
+Still to do: a screen in the admin UI. The API is shaped for one — the card lists come back in the
+registration, so the picker is a `<select>` over `outputs[]` and `inputs[]`, and everything else is a
+form over the device record.
+
+Zones need no changes at all: a Sonn client's player is an ordinary Sendspin output, so a room is
+assigned on the Zones screen against the `client_id` this screen created. Sources likewise —
+`SendspinLineInService` already maps a line-in input whose `source.type` is `sendspin` to a client id
+and consumes its type-12 frames.
 
 ## Roadmap on the device
 

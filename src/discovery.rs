@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use tracing::warn;
 
 const SERVICE_TYPE: &str = "_sonncore._tcp.local.";
-const DEFAULT_REGISTER_PATH: &str = "/api/clients/register";
-const DEFAULT_STATUS_PATH: &str = "/api/clients/{device_id}/status";
+const DEFAULT_REGISTER_PATH: &str = "/api/sonnclients/register";
+const DEFAULT_STATUS_PATH: &str = "/api/sonnclients/{device_id}/status";
 
 #[derive(Debug, Clone)]
 pub struct DiscoveredServer {
@@ -69,12 +69,12 @@ pub fn discover_server(
                 let register_path = normalize_path(
                     txt.get("client_register")
                         .cloned()
-                        .unwrap_or_else(|| format!("{}/clients/register", api_prefix)),
+                        .unwrap_or_else(|| format!("{}/sonnclients/register", api_prefix)),
                 );
                 let status_path = normalize_path(
                     txt.get("client_status")
                         .cloned()
-                        .unwrap_or_else(|| format!("{}/clients/{{device_id}}/status", api_prefix)),
+                        .unwrap_or_else(|| format!("{}/sonnclients/{{device_id}}/status", api_prefix)),
                 );
                 candidates.push(DiscoveredServer {
                     base_url,

@@ -76,6 +76,12 @@ pub struct ClientRegisterRequest {
     /// OS description, e.g. `Debian GNU/Linux 12 (bookworm) aarch64`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
+    /// CPU architecture, as the build reports it: `aarch64`, `arm`, `x86_64`.
+    ///
+    /// Its own field rather than something the server parses out of `os`: it decides which build of
+    /// a managed component this device is handed, and guessing that wrong installs a daemon that
+    /// cannot run.
+    pub arch: String,
     pub outputs: Vec<OutputDeviceInfo>,
     /// Capture devices, for the source role. Same shape as outputs: a sound card is a sound card.
     pub inputs: Vec<OutputDeviceInfo>,

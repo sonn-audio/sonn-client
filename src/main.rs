@@ -341,6 +341,7 @@ fn build_register_request(
         mac: identity.mac.clone(),
         model: identity.model.clone(),
         os: identity.os.clone(),
+        arch: identity.arch.clone(),
         outputs: outputs.to_vec(),
         inputs: inputs.to_vec(),
         capabilities: ClientCapabilities {

@@ -12,6 +12,8 @@ pub struct DeviceIdentity {
     pub mac: Option<String>,
     pub model: Option<String>,
     pub os: Option<String>,
+    /// What the server picks a component build by.
+    pub arch: String,
 }
 
 pub fn collect() -> DeviceIdentity {
@@ -23,6 +25,7 @@ pub fn collect() -> DeviceIdentity {
         mac: primary_mac(),
         model: hardware_model(),
         os: os_description(),
+        arch: std::env::consts::ARCH.to_string(),
     }
 }
 
@@ -73,12 +76,5 @@ fn os_description() -> Option<String> {
         line.strip_prefix("PRETTY_NAME=")
             .map(|value| value.trim_matches('"').to_string())
     })?;
-    Some(match arch() {
-        Some(arch) => format!("{} {}", pretty, arch),
-        None => pretty,
-    })
-}
-
-fn arch() -> Option<String> {
-    Some(std::env::consts::ARCH.to_string())
+    Some(format!("{} {}", pretty, std::env::consts::ARCH))
 }
