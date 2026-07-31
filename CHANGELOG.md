@@ -1,3 +1,10 @@
+## [1.0.5](https://github.com/sonn-audio/sonn-client/compare/v1.0.4...v1.0.5) (2026-07-31)
+
+
+### Bug Fixes
+
+* **config:** say when a setting in config.toml was not understood ([040de92](https://github.com/sonn-audio/sonn-client/commit/040de928930c6a9042d1f247d74b0196d76d8208))
+
 ## [1.0.4](https://github.com/sonn-audio/sonn-client/compare/v1.0.3...v1.0.4) (2026-07-31)
 
 
