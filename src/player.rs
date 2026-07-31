@@ -418,6 +418,9 @@ async fn apply_settings(
 /// it. Echoing a change the server itself asked for is harmless -- the reference client does the same.
 async fn report_state(sender: &WsSender, settings: &LiveSettings) {
     let state = ClientState {
+        // A volume report says nothing about whether this player is available, and claiming
+        // either way on every volume change would be the client talking over itself.
+        available: None,
         state: None,
         player: Some(PlayerState {
             volume: Some(settings.volume),

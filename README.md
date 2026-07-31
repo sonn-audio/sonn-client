@@ -43,10 +43,16 @@ in this repo is the device agent around it: discovery, registration, sound-card 
 supervisor that reconciles running players and sources against the server's wishes, the Beoremote
 bridge, and the lifecycle glue the crate leaves to its caller.
 
-The `source@v1` role is not upstream yet — it is in the spec and in the Python reference client, so it
-is added in our fork ([`sonn-audio/sendspin-rs`](https://github.com/sonn-audio/sendspin-rs), branch
-`feat/source-v1`) as one self-contained commit that can be sent upstream as a PR. `Cargo.toml` points
-at the fork; there is a commented `[patch]` for building against a local checkout.
+The dependency is our fork ([`sonn-audio/sendspin-rs`](https://github.com/sonn-audio/sendspin-rs),
+branch `sonn`). It carries the `source@v1` role, which is in the spec and in the Python reference
+client but not in the published crate — and, just as much for playback, the fixes a *player* needs
+against our own server: a paused group that would otherwise fail to parse and take the whole
+`group/update` with it, pitch frames, the connection reasons this server sends, and the transmit
+stamp that `required_lead_time_ms` is measured from.
+
+Each of those is a single-purpose branch for upstream; `sonn` is where they are combined so this
+client depends on one thing. `Cargo.toml` has a commented `[patch]` for building against a local
+checkout.
 
 ## Commands
 
@@ -121,9 +127,8 @@ Release builds for all four Linux targets are cross-compiled in CI (`cross build
 
 ### Building against the fork
 
-`source@v1` is not in the published crate, so the dependency points at our fork's branch. Until that
-branch is pushed, build against a checkout next door — `sendspin-rs` beside this repo, on
-`feat/source-v1` — by uncommenting the `[patch]` block at the bottom of `Cargo.toml`.
+Until the fork is pushed, build against a checkout next door — `sendspin-rs` beside this repo, on
+`sonn` — by uncommenting the `[patch]` block at the bottom of `Cargo.toml`.
 
 Verified with cargo 1.97: `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are
 clean and `cargo test` passes (35). What that does *not* cover is a real device: no player, source,
