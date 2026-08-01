@@ -13,7 +13,7 @@
 
 use crate::beoremote::{self, BeoremoteConfig};
 use crate::components;
-use crate::hooks::{ControlHook, VolumeHook};
+use crate::hooks::ControlHook;
 use crate::models::{DesiredConfig, DesiredPlayer, DesiredSource};
 use crate::player::{self, LiveSettings, PlayerParams};
 use crate::source::{self, SignalSettings, SourceParams};
@@ -213,11 +213,9 @@ async fn reconcile_players(
             buffer_ms: player.buffer_ms,
             required_lead_time_ms: player.required_lead_time_ms,
         };
-        let volume_hook = player
-            .volume_hook
-            .clone()
-            .or_else(|| ctx.fallback_volume_hook.clone())
-            .map(VolumeHook::new);
+        // Resolved here rather than in the session loop: it reads the card, and a reconnect should
+        // not re-interrogate the mixer every few seconds.
+        let volume = player::VolumeSink::resolve(player, ctx.fallback_volume_hook.clone()).await;
         let status = ctx.statuses.handle(
             &player.client_id,
             player.output.clone(),
@@ -247,7 +245,7 @@ async fn reconcile_players(
                             &params,
                             &mut settings_rx,
                             &status,
-                            volume_hook.as_ref(),
+                            &volume,
                         ) => result,
                         _ = stop_rx.changed() => {
                             // Dropping the session future closes the card, which is the point of

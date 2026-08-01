@@ -8,6 +8,7 @@
 //! one, and no one has to SSH into a Pi to change a setting.
 
 mod alsa_quiet;
+mod alsa_volume;
 mod beoremote;
 mod components;
 mod config;

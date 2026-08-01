@@ -378,6 +378,51 @@ pub struct DesiredPlayer {
     /// script keeps working. Server-pushed because which speaker needs it is a server-side fact.
     #[serde(default)]
     pub volume_hook: Option<String>,
+    /// Where volume is applied: `auto` (the default), `software`, `alsa` or `hook`.
+    ///
+    /// `auto` means the card's own mixer when it has one, and software gain when it does not -- a
+    /// speaker with real volume should use it, and attenuating in software costs bits the card would
+    /// not have cost. Naming one outright is for the card that has a mixer nobody wants driven.
+    #[serde(default)]
+    pub volume_control: Option<String>,
+    /// ALSA mixer element to drive. Absent means the client picks one (Digital, Master, PCM, then
+    /// whatever the card offers).
+    #[serde(default)]
+    pub mixer_element: Option<String>,
+    /// Whether to spread percentages perceptually across the mixer's range (`amixer -M`).
+    ///
+    /// Absent means the client works it out by reading the mixer, which is right for both kinds of
+    /// hardware; this is for the card that cannot be read, or read wrongly.
+    #[serde(default)]
+    pub mixer_mapped: Option<bool>,
+}
+
+/// Where a player's volume is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeControl {
+    Auto,
+    Software,
+    Alsa,
+    Hook,
+}
+
+impl DesiredPlayer {
+    pub fn volume_control(&self) -> VolumeControl {
+        match self
+            .volume_control
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("software") => VolumeControl::Software,
+            Some("alsa") | Some("mixer") => VolumeControl::Alsa,
+            Some("hook") => VolumeControl::Hook,
+            // Anything else, including a value from a newer server, means "decide for me" rather
+            // than a failure: the worst outcome of guessing here is volume in software.
+            _ => VolumeControl::Auto,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

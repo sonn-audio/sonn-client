@@ -9,8 +9,10 @@
 //! crate; what this module owns is the lifecycle -- how a stream's format change is applied, where
 //! volume goes, what gets reported, and when to give up and reconnect.
 
+use crate::alsa_volume::AlsaMixer;
 use crate::devices;
 use crate::hooks::VolumeHook;
+use crate::models::{DesiredPlayer, VolumeControl};
 use crate::status::{PlayerHandle, STATE_CONNECTED, STATE_CONNECTING, STATE_IDLE, STATE_STREAMING};
 use anyhow::{anyhow, Context, Result};
 use base64::prelude::*;
@@ -66,6 +68,76 @@ pub struct PlayerParams {
     pub required_lead_time_ms: Option<u32>,
 }
 
+/// Where a player's volume ends up.
+///
+/// Decided once when the player starts, because it depends on what the card turns out to be, and a
+/// speaker that moved its own volume yesterday should not be attenuating in software today.
+pub enum VolumeSink {
+    /// Gain in our own mixer. The fallback, not the preference: every dB taken here is resolution
+    /// the card would not have taken.
+    Software,
+    /// A script the server named. Highest precedence -- somebody wired this deliberately.
+    Hook(VolumeHook),
+    /// The card's own mixer.
+    Mixer(AlsaMixer),
+}
+
+impl VolumeSink {
+    pub async fn resolve(player: &DesiredPlayer, fallback_hook: Option<String>) -> Self {
+        let hook = player
+            .volume_hook
+            .clone()
+            .or(fallback_hook)
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty());
+
+        match player.volume_control() {
+            VolumeControl::Software => VolumeSink::Software,
+            VolumeControl::Hook => {
+                match hook {
+                    Some(command) => VolumeSink::Hook(VolumeHook::new(command)),
+                    None => {
+                        warn!("volume_control is hook but no volume_hook was given; using software gain");
+                        VolumeSink::Software
+                    }
+                }
+            }
+            VolumeControl::Alsa => match AlsaMixer::discover(player).await {
+                Some(mixer) => VolumeSink::Mixer(mixer),
+                None => {
+                    warn!("volume_control is alsa but this card has no mixer; using software gain");
+                    VolumeSink::Software
+                }
+            },
+            // A hook is a deliberate act, so it wins over a mixer we merely found.
+            VolumeControl::Auto => match hook {
+                Some(command) => VolumeSink::Hook(VolumeHook::new(command)),
+                None => match AlsaMixer::discover(player).await {
+                    Some(mixer) => VolumeSink::Mixer(mixer),
+                    None => VolumeSink::Software,
+                },
+            },
+        }
+    }
+
+    /// Whether the software mixer is the one doing the attenuating.
+    ///
+    /// When something else is, our own gain stays at unity: attenuating twice -- once here, once in
+    /// the amplifier -- costs bits and makes the zone slider non-linear. Same lesson as the double
+    /// taper in the BeoLab chain.
+    pub fn is_software(&self) -> bool {
+        matches!(self, VolumeSink::Software)
+    }
+
+    pub async fn apply(&self, volume: u8, muted: bool) {
+        match self {
+            VolumeSink::Software => {}
+            VolumeSink::Hook(hook) => hook.apply(volume, muted).await,
+            VolumeSink::Mixer(mixer) => mixer.apply(volume, muted).await,
+        }
+    }
+}
+
 /// Run one connection until it closes, then return so the caller can back off and retry.
 ///
 /// `Ok(())` means the server hung up (or we were told to stop); `Err` means we never got going --
@@ -75,7 +147,7 @@ pub async fn run_session(
     params: &PlayerParams,
     settings_rx: &mut watch::Receiver<LiveSettings>,
     status: &PlayerHandle,
-    volume_hook: Option<&VolumeHook>,
+    volume: &VolumeSink,
 ) -> Result<()> {
     let device = match params.output.as_deref() {
         Some(id) if !id.trim().is_empty() => Some(
@@ -133,13 +205,8 @@ pub async fn run_session(
     let sender = connection.sender;
     let _guard = connection.guard;
 
-    // With a hardware hook the software gain stays at unity: attenuating twice -- once in our mixer,
-    // once in the amplifier -- costs bits and makes the zone slider non-linear. Same lesson as the
-    // double taper in the BeoLab chain.
-    let software_volume = volume_hook.is_none();
-    if let Some(hook) = volume_hook {
-        hook.apply(settings.volume, settings.muted).await;
-    }
+    let software_volume = volume.is_software();
+    volume.apply(settings.volume, settings.muted).await;
 
     let mut player: Option<SyncedPlayer> = None;
     let mut format: Option<AudioFormat> = None;
@@ -187,7 +254,7 @@ pub async fn run_session(
                     continue;
                 }
                 settings = next;
-                apply_settings(&settings, player.as_ref(), volume_hook, software_volume, status, &sender).await;
+                apply_settings(&settings, player.as_ref(), volume, software_volume, status, &sender).await;
             }
             message = message_rx.recv() => {
                 // `None` is the socket closing: end the session so the supervisor can reconnect.
@@ -273,7 +340,7 @@ pub async fn run_session(
                             apply_settings(
                                 &settings,
                                 player.as_ref(),
-                                volume_hook,
+                                volume,
                                 software_volume,
                                 status,
                                 &sender,
@@ -391,7 +458,7 @@ fn apply_command(mut settings: LiveSettings, command: &PlayerCommand) -> LiveSet
 async fn apply_settings(
     settings: &LiveSettings,
     player: Option<&SyncedPlayer>,
-    volume_hook: Option<&VolumeHook>,
+    volume: &VolumeSink,
     software_volume: bool,
     status: &PlayerHandle,
     sender: &WsSender,
@@ -403,9 +470,7 @@ async fn apply_settings(
             open.set_mute(settings.muted);
         }
     }
-    if let Some(hook) = volume_hook {
-        hook.apply(settings.volume, settings.muted).await;
-    }
+    volume.apply(settings.volume, settings.muted).await;
     status.set_volume(settings.volume, settings.muted);
     status.set_static_delay(settings.static_delay_ms);
     report_state(sender, settings).await;
