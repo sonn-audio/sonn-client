@@ -182,7 +182,10 @@ broken.
       "muted": false,
       "buffer_ms": 500,
       "required_lead_time_ms": 500,
-      "volume_hook": null
+      "volume_hook": null,
+      "volume_control": "auto",
+      "mixer_element": null,
+      "mixer_mapped": null
     }
   ],
   "sources": [
@@ -242,9 +245,15 @@ Semantics the server should count on:
 - **`sample_rate`/`bit_depth` null** means "advertise everything this build supports" — 44.1 and 48
   kHz at 16 and 24 bit. That is what lets the server's bit-perfect path pass a 44.1 kHz album through
   without a resample. Pin them only for hardware that genuinely accepts one rate.
-- **`volume_hook`** switches this player to hardware volume: the client runs `<command> <level>`
-  (0 when muted) and leaves its software mixer at unity, so the level is not attenuated twice. Same
-  contract as the reference client's `--hook-set-volume`.
+- **`volume_control`** says where volume is applied: `auto` (the default) uses the card's own mixer
+  when it has one and software gain when it does not, `alsa` and `software` insist, and `hook` runs
+  the script. Whatever applies it, the software mixer stays at unity so the level is not attenuated
+  twice. `mixer_element` names the mixer control if the usual ones are not what this card calls it,
+  and `mixer_mapped` overrides the client's reading of the mixer's scale — see the README for what
+  that reading is and why it matters on a mixer calibrated in dB.
+- **`volume_hook`** is the script `hook` runs, and wins over a mixer when `volume_control` is `auto`:
+  the client runs `<command> <level>` (0 when muted). Same contract as the reference client's
+  `--hook-set-volume`.
 - **`commands`** are one-shot, oldest first, and drained on the poll that returns them. The
   vocabulary is the server's; the client passes each one to its command hook untouched, so the server
   can add commands without a client release.

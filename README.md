@@ -100,14 +100,39 @@ and "the server is not there" do not look alike.
 
 ## Hardware volume
 
-A speaker with real volume of its own should use it. Point `volume_hook` at a script and the client
-calls it as `<script> <level>` with the effective level 0–100, sending `0` for muted — the same
-contract as the reference client's `--hook-set-volume`, so an existing script works unchanged. While a
-hook is in use the software mixer stays at unity: attenuating in both places costs bits and makes the
-zone slider non-linear.
+A speaker with real volume of its own should use it. Volume therefore goes to the sound card's own
+playback mixer whenever it has one, and the software mixer stays at unity — attenuating in both
+places costs bits and makes the zone slider non-linear. Where a card has no mixer, gain is applied in
+software as before.
 
-Normally the server pushes this per player (`players[].volume_hook`); the config field is the local
-default.
+The server decides per speaker with `players[].volume_control`:
+
+| Value | Meaning |
+| ---------- | -------------------------------------------------------------- |
+| `auto` (default) | the card's mixer if it has one, software gain if not |
+| `alsa` | always the card's mixer |
+| `software` | never touch the mixer |
+| `hook` | run `volume_hook` |
+
+A `volume_hook` is a deliberate act, so it wins over a mixer that was merely found: point it at a
+script and the client calls `<script> <level>` with the effective level 0–100, sending `0` for muted
+— the same contract as the reference client's `--hook-set-volume`, so an existing script works
+unchanged. The config file's `volume_hook` is the local default for players the server gave none.
+
+### Which scale a mixer is on
+
+`amixer -M` spreads a percentage perceptually across the raw register range. That is right for the
+DAC HATs whose mixers are linear in register steps — without it, 50% lands halfway down the register
+and sounds far quieter than expected. It is wrong for a mixer already calibrated in dB, where one
+step is one dB: there the hardware does the perceptual mapping itself and `-M` lays a second curve on
+top, so a percentage no longer corresponds to a known attenuation. On a B&O BeoLab over USB, which
+reports `0-90` spanning `-90..0 dB`, 30% is -63 dB with `-M` and -30 dB without.
+
+The client works this out by reading the mixer rather than asking: a card whose current level in dB
+equals its distance from the top in steps is calibrated in dB and is addressed directly. At maximum
+both readings are zero on any mixer, so nothing is concluded there. `players[].mixer_mapped` settles
+it outright for a card that reads wrongly, and `players[].mixer_element` names the element when the
+usual ones (`Digital`, `Master`, `PCM`) are not what this card calls it.
 
 ## Management protocol
 
