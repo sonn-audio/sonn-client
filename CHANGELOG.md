@@ -1,3 +1,10 @@
+## [1.0.8](https://github.com/sonn-audio/sonn-client/compare/v1.0.7...v1.0.8) (2026-08-01)
+
+
+### Bug Fixes
+
+* play at the rate the stream is in ([e362e56](https://github.com/sonn-audio/sonn-client/commit/e362e5683d80b39e2528465e17e702d3a0044686))
+
 ## [1.0.7](https://github.com/sonn-audio/sonn-client/compare/v1.0.6...v1.0.7) (2026-07-31)
 
 
