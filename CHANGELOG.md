@@ -1,3 +1,10 @@
+# [1.1.0](https://github.com/sonn-audio/sonn-client/compare/v1.0.8...v1.1.0) (2026-08-01)
+
+
+### Features
+
+* **volume:** use the sound card's own volume, on the scale it is calibrated in ([8613819](https://github.com/sonn-audio/sonn-client/commit/86138197a1fa1e52f0cd6ffdd5bcaf798cc35d81))
+
 ## [1.0.8](https://github.com/sonn-audio/sonn-client/compare/v1.0.7...v1.0.8) (2026-08-01)
 
 
