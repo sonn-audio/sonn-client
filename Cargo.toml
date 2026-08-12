@@ -34,6 +34,9 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 uuid = { version = "1.8", features = ["v4"] }
+# Pairing a Beoremote One means holding an org.bluez.Agent1 open on D-Bus for the whole window;
+# see src/pairing.rs for why a bluetoothctl child process cannot do it.
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 # Working on the fork and this client together, or building before the fork is pushed: uncomment to
 # build against the checkout next door (on `sonn`) instead of what is on GitHub.
