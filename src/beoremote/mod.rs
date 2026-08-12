@@ -231,6 +231,11 @@ async fn serve_remote(
                         republish(&service, &api, statuses, config, hid_connected, None).await?;
                 }
             }
+            // bluetoothd going away takes the registration with it; the outer loop puts it back.
+            _ = service.wait_until_bluez_goes_away() => {
+                warn!("bluez went away; re-registering the beoremote service");
+                return Ok(());
+            }
             _ = menu_poll.tick() => {
                 // Re-read every tick and only republish on a real change: the remote is not
                 // disturbed for nothing, and a new favourite still shows up within one interval.

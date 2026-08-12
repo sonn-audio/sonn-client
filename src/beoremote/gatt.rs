@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
+use zbus::fdo::DBusProxy;
+use zbus::names::BusName;
 use zbus::object_server::SignalEmitter;
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 use zbus::{interface, proxy, Connection};
@@ -32,8 +34,12 @@ use zbus::{interface, proxy, Connection};
 /// Where our application lives on the bus. BlueZ only needs it to be ours and stable.
 const APP_PATH: &str = "/sonn/beoremote";
 const SERVICE_PATH: &str = "/sonn/beoremote/service0";
-const DIS_PATH: &str = "/sonn/beoremote/dis";
+const DIS_PATH: &str = "/sonn/beoremote/service1";
 const ADAPTER_PATH: &str = "/org/bluez/hci0";
+/// How often to check that bluez is still there.
+const BLUEZ_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+/// The only attribute the remote subscribes to, and so the only one that needs a `Value` property.
+const NOTIFYING_ATTRIBUTE: &str = "FEATURES_CHANGED";
 
 /// B&O's UUID base. The service is `0000` on it; every attribute is its own number.
 fn uuid_for(number: u8) -> String {
@@ -49,8 +55,14 @@ fn uuid_for(number: u8) -> String {
 const DIS_UUID: &str = "0000180a-0000-1000-8000-00805f9b34fb";
 const PNP_ID_UUID: &str = "00002a50-0000-1000-8000-00805f9b34fb";
 const MANUFACTURER_UUID: &str = "00002a29-0000-1000-8000-00805f9b34fb";
+const MODEL_UUID: &str = "00002a24-0000-1000-8000-00805f9b34fb";
+const FIRMWARE_UUID: &str = "00002a26-0000-1000-8000-00805f9b34fb";
 const PNP_ID: [u8; 7] = [0x01, 0x03, 0x01, 0x0B, 0x10, 0x00, 0x00];
 const MANUFACTURER: &[u8] = b"Bang & Olufsen";
+/// The name B&O's own daemon answers with. All four of these were present in the run the remote
+/// accepted; a characteristic it asks for and does not find is an ATT error mid-introduction.
+const MODEL: &[u8] = b"StreamSDK";
+const FIRMWARE: &[u8] = b"1.0";
 
 /// The attributes, in the order B&O register them.
 const REGISTRATION_ORDER: [(&str, &[Flag]); 44] = [
@@ -167,6 +179,12 @@ struct Characteristic {
     writes: mpsc::Sender<Write>,
 }
 
+/// Deliberately *without* a `Value` property.
+///
+/// With one, bluez can answer a read straight from the cached property; without one it has to call
+/// `ReadValue`, where the offset is honoured and the answer is cut to the negotiated MTU. The lists
+/// here run to a few hundred bytes, and handing a Beoremote One more than it asked for reboots it --
+/// which is what a table with `Value` on every characteristic did, repeatedly, on real hardware.
 #[interface(name = "org.bluez.GattCharacteristic1")]
 impl Characteristic {
     #[zbus(property, name = "UUID")]
@@ -182,12 +200,6 @@ impl Characteristic {
     #[zbus(property, name = "Flags")]
     fn flags(&self) -> Vec<String> {
         self.flags.clone()
-    }
-
-    /// The current value, which is also what BlueZ sends when a notify goes out.
-    #[zbus(property, name = "Value")]
-    fn value(&self) -> Vec<u8> {
-        self.stored()
     }
 
     fn read_value(&self, options: HashMap<String, OwnedValue>) -> zbus::fdo::Result<Vec<u8>> {
@@ -244,11 +256,62 @@ impl Characteristic {
     }
 }
 
+/// The one characteristic that carries a `Value`: it is 16 bytes, and a notification needs a
+/// property to change.
+struct NotifyingCharacteristic {
+    inner: Characteristic,
+}
+
+#[interface(name = "org.bluez.GattCharacteristic1")]
+impl NotifyingCharacteristic {
+    #[zbus(property, name = "UUID")]
+    fn uuid(&self) -> String {
+        self.inner.uuid.clone()
+    }
+
+    #[zbus(property, name = "Service")]
+    fn service(&self) -> OwnedObjectPath {
+        self.inner.service.clone()
+    }
+
+    #[zbus(property, name = "Flags")]
+    fn flags(&self) -> Vec<String> {
+        self.inner.flags.clone()
+    }
+
+    #[zbus(property, name = "Value")]
+    fn value(&self) -> Vec<u8> {
+        self.inner.stored()
+    }
+
+    fn read_value(&self, options: HashMap<String, OwnedValue>) -> zbus::fdo::Result<Vec<u8>> {
+        self.inner.read_value(options)
+    }
+
+    fn write_value(
+        &self,
+        value: Vec<u8>,
+        options: HashMap<String, OwnedValue>,
+    ) -> zbus::fdo::Result<()> {
+        self.inner.write_value(value, options)
+    }
+
+    fn start_notify(&self) {
+        debug!("beoremote notifications on for {}", self.inner.name);
+    }
+
+    fn stop_notify(&self) {
+        debug!("beoremote notifications off for {}", self.inner.name);
+    }
+}
+
 /// The service, registered with BlueZ for as long as this is alive.
 pub struct BeoremoteGatt {
     connection: Connection,
     values: Values,
     paths: HashMap<String, OwnedObjectPath>,
+    /// Which bluetoothd we registered with, so a replacement is recognised as one.
+    owner: Option<String>,
 }
 
 impl BeoremoteGatt {
@@ -292,27 +355,45 @@ impl BeoremoteGatt {
             let Some(number) = attribute_uuid_number(name) else {
                 continue;
             };
-            let path = OwnedObjectPath::try_from(format!("{SERVICE_PATH}/char{index}"))?;
-            server
-                .at(
-                    &path,
-                    Characteristic {
-                        name: (*name).to_string(),
-                        uuid: uuid_for(number),
-                        service: service_path.clone(),
-                        flags: flags.iter().map(|flag| flag.as_str().to_string()).collect(),
-                        values: Arc::clone(&values),
-                        writes: writes.clone(),
-                    },
-                )
-                .await
-                .with_context(|| format!("serve characteristic {name}"))?;
+            // Zero-padded, and Device Information sits at service1: bluez lays the database out in
+            // the order it walks our objects, and it walks them by path. Unpadded indices put char10
+            // before char2, and a "dis" path sorts before "service0" -- which interleaves two
+            // services' characteristics into one another. B&O's own source says the remote caches
+            // handles and that the order must not move; a shuffled, interleaved table is worse than
+            // that, and a remote that reboots when it reads one is not a remote to hand that to.
+            let path = OwnedObjectPath::try_from(format!("{SERVICE_PATH}/char{index:02}"))?;
+            let characteristic = Characteristic {
+                name: (*name).to_string(),
+                uuid: uuid_for(number),
+                service: service_path.clone(),
+                flags: flags.iter().map(|flag| flag.as_str().to_string()).collect(),
+                values: Arc::clone(&values),
+                writes: writes.clone(),
+            };
+            if *name == NOTIFYING_ATTRIBUTE {
+                server
+                    .at(
+                        &path,
+                        NotifyingCharacteristic {
+                            inner: characteristic,
+                        },
+                    )
+                    .await
+                    .with_context(|| format!("serve characteristic {name}"))?;
+            } else {
+                server
+                    .at(&path, characteristic)
+                    .await
+                    .with_context(|| format!("serve characteristic {name}"))?;
+            }
             paths.insert((*name).to_string(), path);
         }
 
         for (index, (name, uuid, value)) in [
             ("PNP_ID", PNP_ID_UUID, PNP_ID.to_vec()),
             ("MANUFACTURER", MANUFACTURER_UUID, MANUFACTURER.to_vec()),
+            ("MODEL", MODEL_UUID, MODEL.to_vec()),
+            ("FIRMWARE", FIRMWARE_UUID, FIRMWARE.to_vec()),
         ]
         .into_iter()
         .enumerate()
@@ -321,7 +402,7 @@ impl BeoremoteGatt {
                 .lock()
                 .map(|mut values| values.insert(name.to_string(), value))
                 .ok();
-            let path = OwnedObjectPath::try_from(format!("{DIS_PATH}/char{index}"))?;
+            let path = OwnedObjectPath::try_from(format!("{DIS_PATH}/char{index:02}"))?;
             server
                 .at(
                     &path,
@@ -349,10 +430,20 @@ impl BeoremoteGatt {
             .await
             .context("register the beoremote service with bluez")?;
 
+        let owner = match DBusProxy::new(&connection).await {
+            Ok(dbus) => dbus
+                .get_name_owner(BusName::try_from("org.bluez")?)
+                .await
+                .ok()
+                .map(|owner| owner.to_string()),
+            Err(_) => None,
+        };
+
         Ok(Self {
             connection,
             values,
             paths,
+            owner,
         })
     }
 
@@ -375,7 +466,7 @@ impl BeoremoteGatt {
         let interface = self
             .connection
             .object_server()
-            .interface::<_, Characteristic>(path)
+            .interface::<_, NotifyingCharacteristic>(path)
             .await?;
         interface
             .get()
@@ -384,6 +475,34 @@ impl BeoremoteGatt {
             .await
             .with_context(|| format!("announce {name}"))?;
         Ok(())
+    }
+
+    /// Resolve when bluez goes away.
+    ///
+    /// A registered application does not survive a bluetoothd restart -- and bluetoothd does restart:
+    /// it segfaulted once during this work, and systemd brought it straight back. Without watching
+    /// for that, the bridge sits there believing it is registered while the remote has nothing to
+    /// read, which looks exactly like a remote that has stopped working.
+    pub async fn wait_until_bluez_goes_away(&self) -> Result<()> {
+        let dbus = DBusProxy::new(&self.connection)
+            .await
+            .context("talk to the bus")?;
+        let name = BusName::try_from("org.bluez")?;
+        // Compared by *owner*, not by existence. systemd restarts bluetoothd in well under a second,
+        // so polling for the name to be missing sees nothing at all -- while the application we
+        // registered is gone with the process that held it.
+        loop {
+            match dbus.get_name_owner(name.clone()).await {
+                Err(_) => return Ok(()),
+                Ok(owner) => {
+                    let owner = owner.to_string();
+                    if self.owner.as_deref().is_some_and(|known| known != owner) {
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(BLUEZ_CHECK_INTERVAL).await;
+        }
     }
 
     pub async fn unregister(&self) {
