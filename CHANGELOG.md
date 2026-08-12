@@ -1,3 +1,10 @@
+## [1.2.2](https://github.com/sonn-audio/sonn-client/compare/v1.2.1...v1.2.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* apply a change to where the volume goes without a restart ([33a5699](https://github.com/sonn-audio/sonn-client/commit/33a5699da4da4a557a3368a4c9e32de557e19f6a))
+
 ## [1.2.1](https://github.com/sonn-audio/sonn-client/compare/v1.2.0...v1.2.1) (2026-08-12)
 
 
