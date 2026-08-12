@@ -498,11 +498,16 @@ impl DesiredPlayer {
         self.enabled.unwrap_or(true)
     }
 
-    /// Everything that can only change by reconnecting. Volume, mute and static delay are absent on
-    /// purpose: those apply to a live player, and a rate change is the only reason to drop audio.
+    /// Everything that can only change by rebuilding the player.
+    ///
+    /// Volume, mute and static delay are absent on purpose: those apply to a running player. Where
+    /// the volume *goes*, though, is decided when the player is built -- the mixer is opened there,
+    /// on the scale chosen there -- so changing that has to cost a restart. A moment of silence when
+    /// someone changes how a speaker's volume works is the honest price; a setting that only takes
+    /// effect after the next reboot is not.
     pub fn restart_key(&self, sendspin_url: &str) -> String {
         format!(
-            "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            "{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
             sendspin_url,
             self.client_id,
             self.name.as_deref().unwrap_or_default(),
@@ -513,6 +518,55 @@ impl DesiredPlayer {
             self.channels,
             self.buffer_ms,
             self.required_lead_time_ms,
+            self.volume_control,
+            self.volume_hook,
+            self.mixer_element,
+            self.mixer_mapped,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn changing_where_the_volume_goes_rebuilds_the_player() {
+        let url = "ws://server/sendspin";
+        let plain = DesiredPlayer::named("speaker");
+        let key = plain.restart_key(url);
+
+        // The mixer is opened when the player is built, on the scale chosen there. A change that
+        // only takes effect after the next reboot is a setting nobody can trust.
+        for changed in [
+            DesiredPlayer {
+                volume_control: Some("alsa".to_string()),
+                ..DesiredPlayer::named("speaker")
+            },
+            DesiredPlayer {
+                mixer_mapped: Some(false),
+                ..DesiredPlayer::named("speaker")
+            },
+            DesiredPlayer {
+                mixer_element: Some("Digital".to_string()),
+                ..DesiredPlayer::named("speaker")
+            },
+            DesiredPlayer {
+                volume_hook: Some("/usr/local/bin/beolab-volume".to_string()),
+                ..DesiredPlayer::named("speaker")
+            },
+        ] {
+            assert_ne!(changed.restart_key(url), key);
+        }
+
+        // The level itself still applies to a running player: nobody should hear a gap because the
+        // server nudged the volume.
+        let seeded = DesiredPlayer {
+            volume: Some(40),
+            muted: Some(true),
+            static_delay_ms: Some(120),
+            ..DesiredPlayer::named("speaker")
+        };
+        assert_eq!(seeded.restart_key(url), key);
     }
 }
