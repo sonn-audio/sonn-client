@@ -527,6 +527,10 @@ fn spawn_shutdown_handler(hooks: Arc<hooks::HookRunner>) {
         // The server fields are empty here: which server we were attached to is not knowable from a
         // signal handler, and the hook's job at this point is to shut hardware down.
         hooks.connection_event("disconnected", "", "").await;
+        // Hand the GATT application back before going. bluez hands out handles by looking for free
+        // space, so an application it still believes in pushes the next one higher up -- and a
+        // Beoremote One caches handles, so it would keep writing to where the service used to be.
+        beoremote::unregister_leftovers().await;
         std::process::exit(0);
     });
 }

@@ -25,19 +25,19 @@
 
 mod api;
 mod gatt;
+pub use gatt::unregister_leftovers;
+mod keys;
 mod protocol;
 
 use crate::models::BeoremoteStatusReport;
 use crate::status::Registry;
 use crate::supervisor::{VolumeIntent, VolumeRequest};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use api::{BeoremoteApi, Menu, SelectOutcome};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
-use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -49,9 +49,6 @@ const DEFAULT_VOLUME_STEP: u8 = 4;
 /// running, which is a normal state on a device whose B&O component was never installed.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// Consumer HID usages. Volume is the only key this bridge interprets.
-const KEY_VOLUME_UP: u8 = 0xE9;
-const KEY_VOLUME_DOWN: u8 = 0xEA;
 
 #[derive(Debug, Clone)]
 pub struct BeoremoteConfig {
@@ -109,9 +106,6 @@ impl BeoremoteConfig {
     }
 }
 
-/// How long bluetoothd gets to attach to the HID socket by itself before the link is assumed to be
-/// an older one that is still routed to uHID. It attaches within milliseconds when it is going to.
-const HOG_ATTACH_GRACE: Duration = Duration::from_secs(5);
 
 /// Run the bridge until told to stop. Returns only on shutdown; connection loss is retried inside.
 pub async fn run(
@@ -121,49 +115,16 @@ pub async fn run(
 ) {
     let hid_connected = Arc::new(AtomicBool::new(false));
 
-    // First, before anything can send a key: with no listener on this socket bluetoothd falls back
-    // to uHID for the whole connection, and the fallback is sticky.
-    match spawn_hid_listener(
-        config.hog_socket.clone(),
-        config.clone(),
-        statuses.clone(),
+    // Keys come from the kernel's input devices: on a stock BlueZ the remote is an ordinary HID
+    // peripheral, and there is no vendor socket in the path at all.
+    tokio::spawn(keys::run(
+        config.api_base_url.clone(),
+        config.zone_id,
+        config.volume_player.clone(),
+        config.volume_step,
         volume_tx.clone(),
-        Arc::clone(&hid_connected),
-    ) {
-        Ok(()) => {}
-        Err(err) => {
-            warn!("beoremote HID socket unavailable: {:#}", err);
-            statuses.set_beoremote(Some(BeoremoteStatusReport {
-                state: "error".to_string(),
-                zone_id: Some(config.zone_id),
-                menu_revision: None,
-                hid_connected: false,
-                last_error: Some(format!("{:#}", err)),
-            }));
-        }
-    }
-
-    // A remote that was already connected when this started is stuck on uHID (see
-    // `drop_remote_link`), so its keys go nowhere. Give bluetoothd a moment to attach to the socket
-    // on its own -- which is what happens when the remote connects *after* us -- and only if it has
-    // not, drop the link so the next key press rebuilds it the right way round.
-    tokio::spawn({
-        let hid_connected = Arc::clone(&hid_connected);
-        async move {
-            tokio::time::sleep(HOG_ATTACH_GRACE).await;
-            if hid_connected.load(Ordering::Relaxed) {
-                return;
-            }
-            match crate::pairing::drop_remote_link().await {
-                Ok(Some(address)) => info!(
-                    "{address} was connected before the bridge was; dropped the link so its keys \
-                     come here -- press any key on the remote to bring it back"
-                ),
-                Ok(None) => debug!("no remote connected yet; its keys will arrive when it connects"),
-                Err(err) => warn!("could not drop the stale remote link: {:#}", err),
-            }
-        }
-    });
+        statuses.clone(),
+    ));
 
     loop {
         statuses.set_beoremote(Some(BeoremoteStatusReport {
@@ -425,106 +386,6 @@ async fn handle_write(
             false
         }
     }
-}
-
-/// Listen for B&O's HID socket and forward key reports.
-///
-/// Its own task: the plugin socket may come and go (bluetoothd restarts) while this listener must
-/// stay up, because losing it makes bluetoothd fall back to uHID for the next connection.
-fn spawn_hid_listener(
-    path: PathBuf,
-    config: BeoremoteConfig,
-    statuses: Registry,
-    volume_tx: mpsc::Sender<VolumeRequest>,
-    hid_connected: Arc<AtomicBool>,
-) -> Result<()> {
-    remove_stale_socket(&path)?;
-    let listener = UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
-    // bluetoothd runs as root; the socket has to be writable by it regardless of who we are.
-    set_socket_permissions(&path)?;
-    info!("beoremote listening on {} for HID reports", path.display());
-
-    tokio::spawn(async move {
-        let api = BeoremoteApi::new(&config.api_base_url, config.zone_id).ok();
-        loop {
-            let (mut stream, _) = match listener.accept().await {
-                Ok(peer) => peer,
-                Err(err) => {
-                    warn!("beoremote HID accept failed: {}", err);
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                    continue;
-                }
-            };
-            info!("bluetoothd connected to the beoremote HID socket");
-            hid_connected.store(true, Ordering::Relaxed);
-            statuses.set_beoremote_hid(true);
-
-            let mut buffer = [0u8; 64];
-            loop {
-                let read = match stream.read(&mut buffer).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(read) => read,
-                };
-                // Reports are 2-byte pairs: code then modifier. A release is code 0.
-                for pair in buffer[..read].chunks_exact(2) {
-                    let (code, _modifier) = (pair[0], pair[1]);
-                    if code == 0 {
-                        continue;
-                    }
-                    handle_key(code, &config, api.as_ref(), &volume_tx).await;
-                }
-            }
-            info!("beoremote HID socket peer disconnected");
-            hid_connected.store(false, Ordering::Relaxed);
-            statuses.set_beoremote_hid(false);
-        }
-    });
-    Ok(())
-}
-
-async fn handle_key(
-    code: u8,
-    config: &BeoremoteConfig,
-    api: Option<&BeoremoteApi>,
-    volume_tx: &mpsc::Sender<VolumeRequest>,
-) {
-    if code == KEY_VOLUME_UP || code == KEY_VOLUME_DOWN {
-        // Kept local: volume arrives in bursts of six presses, and it should keep working while the
-        // server is briefly away. Everything else is the server's decision.
-        let step = i16::from(config.volume_step);
-        let delta = if code == KEY_VOLUME_UP { step } else { -step };
-        let _ = volume_tx
-            .send(VolumeRequest {
-                client_id: config.volume_player.clone(),
-                intent: VolumeIntent::Step(delta),
-            })
-            .await;
-        return;
-    }
-
-    let Some(api) = api else { return };
-    // Forwarded as a raw code. Which button that is is a property of this remote's hardware, and
-    // which action it triggers is a property of the zone -- so the table lives on the server, in one
-    // place, instead of in every bridge.
-    match api.key(code).await {
-        Ok(Some(name)) => info!("beoremote key 0x{:02x} -> {}", code, name),
-        Ok(None) => debug!("beoremote key 0x{:02x} is unassigned", code),
-        Err(err) => warn!("beoremote key 0x{:02x} failed: {:#}", code, err),
-    }
-}
-
-fn remove_stale_socket(path: &Path) -> Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("remove stale socket {}", path.display())),
-    }
-}
-
-fn set_socket_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
-        .with_context(|| format!("chmod {}", path.display()))
 }
 
 #[cfg(test)]

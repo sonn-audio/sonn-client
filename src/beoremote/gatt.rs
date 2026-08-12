@@ -121,13 +121,18 @@ enum Flag {
 }
 
 impl Flag {
-    fn as_str(self) -> &'static str {
+    /// What bluez has to be told this characteristic accepts.
+    ///
+    /// A writable one advertises *both* write forms. The remote sends its selections as
+    /// `Write Command` -- a write without a response -- and bluez drops one of those on a
+    /// characteristic that only declares `write`, without an error anywhere: the press reaches the
+    /// daemon and never reaches us, which looks exactly like a menu item that does nothing.
+    fn as_strs(self) -> &'static [&'static str] {
         match self {
-            // "write" is a write *with* a response; the remote waits for one.
-            Flag::Read => "read",
-            Flag::Write => "write",
-            Flag::Notify => "notify",
-            Flag::Indicate => "indicate",
+            Flag::Read => &["read"],
+            Flag::Write => &["write", "write-without-response"],
+            Flag::Notify => &["notify"],
+            Flag::Indicate => &["indicate"],
         }
     }
 }
@@ -305,6 +310,31 @@ impl NotifyingCharacteristic {
     }
 }
 
+/// Unregister whatever beoremote application this process left with bluez.
+///
+/// Handles are handed out by walking the database for free space, and an application bluez still
+/// believes in occupies its range. Leaving on a signal without saying so pushes the next
+/// registration to higher handles -- and the remote caches handles and subscribes to nothing, not
+/// even Service Changed, so it goes on writing to where the service used to be. Menu picks then
+/// vanish with no error at either end.
+pub async fn unregister_leftovers() {
+    let Ok(connection) = Connection::system().await else {
+        return;
+    };
+    let Ok(path) = ObjectPath::try_from(APP_PATH) else {
+        return;
+    };
+    let Ok(builder) = GattManagerProxy::builder(&connection).path(ADAPTER_PATH) else {
+        return;
+    };
+    if let Ok(manager) = builder.build().await {
+        match manager.unregister_application(&path).await {
+            Ok(()) => debug!("released the beoremote service"),
+            Err(err) => debug!("nothing to release: {err}"),
+        }
+    }
+}
+
 /// The service, registered with BlueZ for as long as this is alive.
 pub struct BeoremoteGatt {
     connection: Connection,
@@ -317,6 +347,10 @@ pub struct BeoremoteGatt {
 impl BeoremoteGatt {
     /// Serve the service and hand BlueZ the application. Writes from the remote arrive on `writes`.
     pub async fn register(writes: mpsc::Sender<Write>) -> Result<Self> {
+        // A previous run that was killed rather than asked to stop leaves its application behind,
+        // and bluez would then put ours above it -- at handles the remote does not know.
+        unregister_leftovers().await;
+
         let connection = Connection::system()
             .await
             .context("connect to the system bus (is dbus running?)")?;
@@ -366,7 +400,10 @@ impl BeoremoteGatt {
                 name: (*name).to_string(),
                 uuid: uuid_for(number),
                 service: service_path.clone(),
-                flags: flags.iter().map(|flag| flag.as_str().to_string()).collect(),
+                flags: flags
+                    .iter()
+                    .flat_map(|flag| flag.as_strs().iter().map(|name| (*name).to_string()))
+                    .collect(),
                 values: Arc::clone(&values),
                 writes: writes.clone(),
             };
@@ -410,7 +447,7 @@ impl BeoremoteGatt {
                         name: name.to_string(),
                         uuid: uuid.to_string(),
                         service: dis_path.clone(),
-                        flags: vec![Flag::Read.as_str().to_string()],
+                        flags: vec!["read".to_string()],
                         values: Arc::clone(&values),
                         writes: writes.clone(),
                     },

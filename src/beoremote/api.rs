@@ -178,8 +178,10 @@ impl BeoremoteApi {
     /// key does is entirely the server's business -- it is the only party that knows whether this
     /// zone is on a line-in (where `next` is a Beo4 command) or a network source (where it advances
     /// the queue).
-    pub async fn key(&self, code: u8) -> Result<Option<String>> {
-        let body = serde_json::json!({ "code": format!("0x{:02x}", code) });
+    pub async fn key(&self, code: u16) -> Result<Option<String>> {
+        // The kernel's key code, as a number. No hex string and no translation: the server decides
+        // what a button means, and it can only do that if it is told what the kernel actually saw.
+        let body = serde_json::json!({ "code": code });
         let response = self
             .client
             .post(self.url("key"))
@@ -188,7 +190,7 @@ impl BeoremoteApi {
             .await
             .context("post key")?;
         if response.status().as_u16() == 404 {
-            debug!("key 0x{:02x} is not assigned on the server", code);
+            debug!("key {code} is not assigned on the server");
             return Ok(None);
         }
         let response = response.error_for_status().context("key response status")?;

@@ -53,13 +53,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const PAIR_ATTEMPTS: u32 = 3;
 /// How long to wait between those attempts, so the record can be filled in from an advertisement.
 const RETRY_PAUSE: Duration = Duration::from_secs(3);
-/// How long to hold the connection open after pairing.
+/// How long to hold the connection open after pairing, at most.
 ///
 /// bluez ties a connection to the D-Bus client that asked for it. When that is this process running
 /// `pair-remote` from a terminal, exiting hangs up on the remote while it is still discovering our
-/// service -- which the remote itself reports as a failed pairing. The daemon keeps its connection
-/// anyway; this only matters for the one-shot command, and it costs a few seconds there.
-const HOLD_AFTER_PAIRING: Duration = Duration::from_secs(20);
+/// service -- which the remote itself then reports as a failed pairing, with nothing on this side to
+/// show for it. A Beoremote One walks all forty-odd characteristics and takes twenty seconds and
+/// more over it, so this waits for the remote to let go rather than counting seconds at it. The
+/// daemon keeps its connection anyway; this only matters for the one-shot command.
+const HOLD_AFTER_PAIRING: Duration = Duration::from_secs(120);
 /// How often to look at what discovery has turned up. A remote advertises in short bursts, so this
 /// is deliberately quicker than a human notices.
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -88,6 +90,8 @@ trait Adapter {
 
 #[proxy(interface = "org.bluez.Device1", default_service = "org.bluez")]
 trait Device {
+    #[zbus(property)]
+    fn connected(&self) -> zbus::Result<bool>;
     fn pair(&self) -> zbus::Result<()>;
     fn connect(&self) -> zbus::Result<()>;
     fn disconnect(&self) -> zbus::Result<()>;
@@ -300,12 +304,32 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         ),
     }
 
-    sleep(HOLD_AFTER_PAIRING).await;
+    hold_until_the_remote_is_done(&device, &found.address).await;
 
     Ok(Some(PairedDevice {
         address: found.address,
         name: found.name,
     }))
+}
+
+/// Stay out of the way until the remote has finished with us.
+async fn hold_until_the_remote_is_done(device: &DeviceProxy<'_>, address: &str) {
+    info!("{address} is paired; holding the connection while it reads our service");
+    let deadline = tokio::time::Instant::now() + HOLD_AFTER_PAIRING;
+    while tokio::time::Instant::now() < deadline {
+        match device.connected().await {
+            Ok(false) => {
+                debug!("{address} disconnected on its own; done");
+                return;
+            }
+            Ok(true) => {}
+            Err(err) => {
+                debug!("could not read {address}'s connection state: {err}");
+                return;
+            }
+        }
+        sleep(POLL_INTERVAL).await;
+    }
 }
 
 /// Pair, allowing for the first attempt on a freshly seen device to fail.
@@ -441,46 +465,6 @@ fn interface<'a>(interfaces: &'a HashMap<OwnedInterfaceName, Properties>, name: 
         .iter()
         .find(|(interface, _)| interface.as_str() == name)
         .map(|(_, properties)| properties)
-}
-
-/// Drop the link to a connected remote so it is rebuilt from scratch.
-///
-/// bluetoothd decides *when the HID link comes up* whether key reports go to the bridge's socket or
-/// to uHID, and the choice sticks for the whole connection. A remote that was already connected when
-/// the bridge started therefore keeps talking to uHID: no keys arrive, nothing logs an error, and the
-/// remote goes on showing whatever menu it last read from somebody else. Dropping the link once is
-/// the cure -- it is trusted, so the next key press brings it back, this time through the socket.
-///
-/// Returns the address of the remote that was disconnected, or `None` if none was connected.
-pub async fn drop_remote_link() -> Result<Option<String>> {
-    let connection = Connection::system()
-        .await
-        .context("connect to the system bus")?;
-    for (path, interfaces) in managed_objects(&connection).await? {
-        let Some(properties) = interface(&interfaces, "org.bluez.Device1") else {
-            continue;
-        };
-        let name = string_property(properties, "Alias")
-            .or_else(|| string_property(properties, "Name"))
-            .unwrap_or_default();
-        if !name.to_uppercase().starts_with(REMOTE_NAME_PREFIX)
-            || !bool_property(properties, "Connected").unwrap_or(false)
-        {
-            continue;
-        }
-        let address = string_property(properties, "Address").unwrap_or_default();
-        let device = DeviceProxy::builder(&connection)
-            .path(path)?
-            .build()
-            .await
-            .context("talk to the remote")?;
-        device
-            .disconnect()
-            .await
-            .with_context(|| format!("disconnect {address}"))?;
-        return Ok(Some(address));
-    }
-    Ok(None)
 }
 
 async fn managed_objects(connection: &Connection) -> Result<ManagedObjects> {
