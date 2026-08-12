@@ -1,3 +1,10 @@
+## [1.2.1](https://github.com/sonn-audio/sonn-client/compare/v1.2.0...v1.2.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* follow the volume when the speaker's own control moves it ([9e4ac0b](https://github.com/sonn-audio/sonn-client/commit/9e4ac0bb7f9a2bcf7f813a90d14f1fabc3224a2f))
+
 # [1.2.0](https://github.com/sonn-audio/sonn-client/compare/v1.1.0...v1.2.0) (2026-08-12)
 
 
