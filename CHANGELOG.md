@@ -1,3 +1,10 @@
+## [1.4.2](https://github.com/sonn-audio/sonn-client/compare/v1.4.1...v1.4.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* **pairing:** start over when someone presses pair ([d640c11](https://github.com/sonn-audio/sonn-client/commit/d640c11fa2e10e4f36d754f6e2dbdf96dd713a66))
+
 ## [1.4.1](https://github.com/sonn-audio/sonn-client/compare/v1.4.0...v1.4.1) (2026-08-12)
 
 
