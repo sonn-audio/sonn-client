@@ -27,6 +27,7 @@ jobs:
         with:
           node-version: "20"
       - name: Run semantic-release
+        id: semantic
         uses: cycjimmy/semantic-release-action@v4
         with:
           extra_plugins: |
@@ -38,3 +39,17 @@ jobs:
             @semantic-release/github
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # The only signal that a release happened. Without it the release workflow has to guess, and
+      # guessing means picking the newest tag that exists -- which is the *previous* release, whose
+      # binaries then get replaced by code it was never built from.
+      - name: Record the release that was published
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: echo "v${{ steps.semantic.outputs.new_release_version }}" > release-tag.txt
+      - name: Hand the tag to the release workflow
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-tag
+          path: release-tag.txt
+          retention-days: 1
