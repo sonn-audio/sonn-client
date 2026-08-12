@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/sonn-audio/sonn-client/compare/v1.2.2...v1.3.0) (2026-08-12)
+
+
+### Features
+
+* **update:** let a speaker install its own new version ([0b33e31](https://github.com/sonn-audio/sonn-client/commit/0b33e31eddef353823d5ce39817862e84ca37c16))
+
 ## [1.2.2](https://github.com/sonn-audio/sonn-client/compare/v1.2.1...v1.2.2) (2026-08-12)
 
 
