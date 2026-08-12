@@ -17,6 +17,7 @@ use crate::models::{DesiredConfig, DesiredPlayer, DesiredSource};
 use crate::player::{self, LiveSettings};
 use crate::source::{self, SignalSettings};
 use crate::status::Registry;
+use crate::update;
 use std::collections::HashMap;
 use std::future::Future;
 use std::thread::JoinHandle;
@@ -506,12 +507,20 @@ async fn reconcile_components(
         })
         .collect::<Vec<_>>()
         .join(",");
-    if key == *last_key {
+    // An update that was put off because this speaker was playing has to be tried again, and the
+    // desired state has not changed in the meantime -- so the usual "nothing new" shortcut would
+    // mean waiting for the next config edit to install a version that was already asked for.
+    let update_waiting = desired.components.iter().any(|component| {
+        component.name == crate::update::SONN_CLIENT && update::is_wanted(component)
+    });
+    if key == *last_key && !update_waiting {
         return;
     }
     *last_key = key;
 
-    let reports = components::reconcile(&desired.components).await;
+    // Only the client's own update waits for this; nothing else here interrupts audio.
+    let busy = ctx.statuses.device_state() == crate::status::STATE_STREAMING;
+    let reports = components::reconcile(&desired.components, busy).await;
     for report in &reports {
         if let Some(error) = report.last_error.as_deref() {
             warn!("component {}: {}", report.name, error);

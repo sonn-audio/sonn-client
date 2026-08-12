@@ -24,6 +24,7 @@ mod server_api;
 mod source;
 mod status;
 mod supervisor;
+mod update;
 
 use anyhow::Result;
 use std::collections::HashMap;
@@ -294,6 +295,9 @@ async fn register(api: &ServerApi, request: &ClientRegisterRequest) -> Registrat
                     request.outputs.len(),
                     desired.players.len()
                 );
+                // The first honest moment to call an update successful: this build started *and*
+                // reached a server. Until now the previous binary was still standing by.
+                update::confirm_started();
                 return Registration::Accepted(Box::new(desired));
             }
             Err(err) => {

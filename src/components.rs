@@ -42,12 +42,20 @@ pub const STATE_FAILED: &str = "failed";
 /// Bring the installed components in line with what the server asked for.
 ///
 /// Returns the status of everything it knows about, installed or not, so the server can offer (or
-/// grey out) the features that depend on them.
-pub async fn reconcile(desired: &[DesiredComponent]) -> Vec<ComponentStatus> {
+/// grey out) the features that depend on them. `busy` says whether this device is playing, which
+/// only the client's own update waits for -- nothing else here interrupts audio.
+pub async fn reconcile(desired: &[DesiredComponent], busy: bool) -> Vec<ComponentStatus> {
     let mut reports = Vec::new();
     let mut seen = false;
 
     for component in desired {
+        if component.name == crate::update::SONN_CLIENT {
+            // The client updating itself is the same shape as installing anything else: a version,
+            // a url and a hash. What differs is that it ends by replacing the running process, so
+            // it lives in its own module.
+            reports.push(crate::update::reconcile(component, busy).await);
+            continue;
+        }
         if component.name != BEOREMOTE_BLUETOOTHD {
             reports.push(ComponentStatus {
                 name: component.name.clone(),

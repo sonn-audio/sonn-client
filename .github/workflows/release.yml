@@ -98,11 +98,18 @@ jobs:
           version="${{ needs.resolve.outputs.tag }}"
           version="${version#v}"
           bin_dir="target/${{ matrix.target }}/release"
-          tar -czf "sonn-client-${version}-${{ matrix.target }}.tar.gz" -C "${bin_dir}" sonn-client
+          archive="sonn-client-${version}-${{ matrix.target }}.tar.gz"
+          tar -czf "${archive}" -C "${bin_dir}" sonn-client
+          # Published beside the tarball because a device that updates itself has to be able to
+          # verify what it fetched, and it has no other way to learn what the right bytes are.
+          sha256sum "${archive}" > "${archive}.sha256"
+          cat "${archive}.sha256"
       - name: Upload Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.resolve.outputs.tag }}
-          files: sonn-client-*.tar.gz
+          files: |
+            sonn-client-*.tar.gz
+            sonn-client-*.tar.gz.sha256
           fail_on_unmatched_files: true
           generate_release_notes: true
