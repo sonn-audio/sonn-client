@@ -110,6 +110,10 @@ impl BeoremoteConfig {
     }
 }
 
+/// How long bluetoothd gets to attach to the HID socket by itself before the link is assumed to be
+/// an older one that is still routed to uHID. It attaches within milliseconds when it is going to.
+const HOG_ATTACH_GRACE: Duration = Duration::from_secs(5);
+
 /// Run the bridge until told to stop. Returns only on shutdown; connection loss is retried inside.
 pub async fn run(
     config: BeoremoteConfig,
@@ -139,6 +143,28 @@ pub async fn run(
             }));
         }
     }
+
+    // A remote that was already connected when this started is stuck on uHID (see
+    // `drop_remote_link`), so its keys go nowhere. Give bluetoothd a moment to attach to the socket
+    // on its own -- which is what happens when the remote connects *after* us -- and only if it has
+    // not, drop the link so the next key press rebuilds it the right way round.
+    tokio::spawn({
+        let hid_connected = Arc::clone(&hid_connected);
+        async move {
+            tokio::time::sleep(HOG_ATTACH_GRACE).await;
+            if hid_connected.load(Ordering::Relaxed) {
+                return;
+            }
+            match crate::pairing::drop_remote_link().await {
+                Ok(Some(address)) => info!(
+                    "{address} was connected before the bridge was; dropped the link so its keys \
+                     come here -- press any key on the remote to bring it back"
+                ),
+                Ok(None) => debug!("no remote connected yet; its keys will arrive when it connects"),
+                Err(err) => warn!("could not drop the stale remote link: {:#}", err),
+            }
+        }
+    });
 
     loop {
         statuses.set_beoremote(Some(BeoremoteStatusReport {

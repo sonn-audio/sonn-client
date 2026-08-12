@@ -75,6 +75,7 @@ trait Adapter {
 trait Device {
     fn pair(&self) -> zbus::Result<()>;
     fn connect(&self) -> zbus::Result<()>;
+    fn disconnect(&self) -> zbus::Result<()>;
     #[zbus(property)]
     fn set_trusted(&self, trusted: bool) -> zbus::Result<()>;
 }
@@ -402,6 +403,46 @@ fn interface<'a>(interfaces: &'a HashMap<OwnedInterfaceName, Properties>, name: 
         .iter()
         .find(|(interface, _)| interface.as_str() == name)
         .map(|(_, properties)| properties)
+}
+
+/// Drop the link to a connected remote so it is rebuilt from scratch.
+///
+/// bluetoothd decides *when the HID link comes up* whether key reports go to the bridge's socket or
+/// to uHID, and the choice sticks for the whole connection. A remote that was already connected when
+/// the bridge started therefore keeps talking to uHID: no keys arrive, nothing logs an error, and the
+/// remote goes on showing whatever menu it last read from somebody else. Dropping the link once is
+/// the cure -- it is trusted, so the next key press brings it back, this time through the socket.
+///
+/// Returns the address of the remote that was disconnected, or `None` if none was connected.
+pub async fn drop_remote_link() -> Result<Option<String>> {
+    let connection = Connection::system()
+        .await
+        .context("connect to the system bus")?;
+    for (path, interfaces) in managed_objects(&connection).await? {
+        let Some(properties) = interface(&interfaces, "org.bluez.Device1") else {
+            continue;
+        };
+        let name = string_property(properties, "Alias")
+            .or_else(|| string_property(properties, "Name"))
+            .unwrap_or_default();
+        if !name.to_uppercase().starts_with(REMOTE_NAME_PREFIX)
+            || !bool_property(properties, "Connected").unwrap_or(false)
+        {
+            continue;
+        }
+        let address = string_property(properties, "Address").unwrap_or_default();
+        let device = DeviceProxy::builder(&connection)
+            .path(path)?
+            .build()
+            .await
+            .context("talk to the remote")?;
+        device
+            .disconnect()
+            .await
+            .with_context(|| format!("disconnect {address}"))?;
+        return Ok(Some(address));
+    }
+    Ok(None)
 }
 
 async fn managed_objects(connection: &Connection) -> Result<ManagedObjects> {
