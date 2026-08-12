@@ -49,6 +49,17 @@ const BLUEZ: &str = "org.bluez";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(40);
 /// How long to wait for the first connection. Short: it is a courtesy, not the pairing.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How many times to ask for a pairing before giving up. See `pair_with_retries`.
+const PAIR_ATTEMPTS: u32 = 3;
+/// How long to wait between those attempts, so the record can be filled in from an advertisement.
+const RETRY_PAUSE: Duration = Duration::from_secs(3);
+/// How long to hold the connection open after pairing.
+///
+/// bluez ties a connection to the D-Bus client that asked for it. When that is this process running
+/// `pair-remote` from a terminal, exiting hangs up on the remote while it is still discovering our
+/// service -- which the remote itself reports as a failed pairing. The daemon keeps its connection
+/// anyway; this only matters for the one-shot command, and it costs a few seconds there.
+const HOLD_AFTER_PAIRING: Duration = Duration::from_secs(20);
 /// How often to look at what discovery has turned up. A remote advertises in short bursts, so this
 /// is deliberately quicker than a human notices.
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -66,6 +77,10 @@ trait AgentManager {
 
 #[proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 trait Adapter {
+    fn set_discovery_filter(
+        &self,
+        filter: HashMap<&str, zbus::zvariant::Value<'_>>,
+    ) -> zbus::Result<()>;
     fn start_discovery(&self) -> zbus::Result<()>;
     fn stop_discovery(&self) -> zbus::Result<()>;
     fn remove_device(&self, device: &ObjectPath<'_>) -> zbus::Result<()>;
@@ -222,6 +237,14 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
     // entry is the only place `BEORC` is written down. Removing it cost an entire window once.
     forget_existing_bonds(&connection, &adapter, address.as_deref()).await;
 
+    // LE only. Without the filter bluez discovers dual-mode, files a remote that is LE-only as a
+    // BR/EDR device, and then pairs by *paging* it -- which it never answers: "Page Timeout".
+    if let Err(err) = adapter
+        .set_discovery_filter(HashMap::from([("Transport", "le".into())]))
+        .await
+    {
+        debug!("could not ask for an LE-only scan: {err}");
+    }
     adapter.start_discovery().await.context("start scanning")?;
     info!(
         "scanning up to {}s for a {}* remote",
@@ -255,23 +278,7 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         .context("talk to the remote")?;
 
     info!("pairing {}", found.address);
-    match timeout(PAIR_TIMEOUT, device.pair()).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            return Err(anyhow!(
-                "the adapter refused to pair with {}: {}",
-                found.address,
-                err
-            ))
-        }
-        Err(_) => {
-            return Err(anyhow!(
-                "{} did not answer within {}s -- it may have left pairing mode",
-                found.address,
-                PAIR_TIMEOUT.as_secs()
-            ))
-        }
-    }
+    pair_with_retries(&device, &found.address).await?;
 
     // Without this a remote works exactly once: every reconnect wants authorising again, and
     // nothing on the remote says so -- it simply stops responding after a while.
@@ -293,10 +300,41 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         ),
     }
 
+    sleep(HOLD_AFTER_PAIRING).await;
+
     Ok(Some(PairedDevice {
         address: found.address,
         name: found.name,
     }))
+}
+
+/// Pair, allowing for the first attempt on a freshly seen device to fail.
+///
+/// A device record bluez has only just built carries no LE detail yet, and the first `Pair()` on one
+/// reaches for BR/EDR and times out paging. The advertisement that follows fills the record in, and
+/// the next attempt goes over LE. Measured repeatedly on the hardware, on two different daemons --
+/// so it is retried here rather than reported as a failure the user can do nothing with.
+async fn pair_with_retries(device: &DeviceProxy<'_>, address: &str) -> Result<()> {
+    let mut last = None;
+    for attempt in 1..=PAIR_ATTEMPTS {
+        match timeout(PAIR_TIMEOUT, device.pair()).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(err)) => {
+                debug!("pairing {address} attempt {attempt} failed: {err}");
+                last = Some(anyhow!("the adapter refused to pair with {address}: {err}"));
+            }
+            Err(_) => {
+                last = Some(anyhow!(
+                    "{address} did not answer within {}s -- it may have left pairing mode",
+                    PAIR_TIMEOUT.as_secs()
+                ));
+            }
+        }
+        if attempt < PAIR_ATTEMPTS {
+            sleep(RETRY_PAUSE).await;
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow!("pairing {address} failed")))
 }
 
 /// Keep polling what BlueZ has discovered until a remote is on the air.
