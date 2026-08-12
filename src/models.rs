@@ -228,6 +228,23 @@ pub struct DesiredConfig {
     /// the server's; we hand each one to the command hook untouched.
     #[serde(default)]
     pub commands: Vec<DeviceCommand>,
+    /// Transport for the gear on an input: start it, skip a track, pick a disc.
+    ///
+    /// Its own list rather than a device command, because it is addressed at one of this device's
+    /// sources and runs that source's own hook. The Sendspin source role carries no command at all,
+    /// so this is the channel that has one.
+    #[serde(default)]
+    pub source_commands: Vec<SourceCommand>,
+}
+
+/// One transport command for the hardware behind a source.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SourceCommand {
+    /// Which of this device's sources it is for.
+    pub client_id: String,
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 /// One Sendspin source: a capture device offered to the server as a selectable input.

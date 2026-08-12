@@ -386,13 +386,7 @@ async fn reconcile_sources(
         // Transport controls used to ride on the source role. The protocol has no such message --
         // that surface was this client's invention -- so a configured hook would now be a setting
         // that silently does nothing, which is worse than one that is missing.
-        if desired_source.control_hook.is_some() || desired_source.controls.is_some() {
-            warn!(
-                client_id = %desired_source.client_id,
-                "transport controls are configured for this input, but the source role carries no \
-                 command for them; they are not being used"
-            );
-        }
+
         let built = source::build(desired_source, name);
         let session = match built {
             Ok(session) => session,

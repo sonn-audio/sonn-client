@@ -69,6 +69,14 @@ impl HookRunner {
 /// The command text is left exactly as configured and the hook's arguments arrive as the script's
 /// positional parameters -- appending `"$@"` to the text itself would double the arguments for any
 /// script that already refers to them.
+/// Run one input's control hook as `<script> <command> [args...]`.
+///
+/// The command name goes through untouched: what `play` or `disc 3` means is the business of the
+/// script that speaks to the hardware, not of this client.
+pub async fn run_control_hook(script: &str, command: &str, args: &[String]) {
+    run(shell_argv(script, command, args), "control").await;
+}
+
 fn shell_argv(script: &str, first: &str, rest: &[String]) -> Command {
     let mut cmd = Command::new("sh");
     cmd.arg("-c")

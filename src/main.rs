@@ -38,7 +38,7 @@ use tracing::{info, warn};
 use crate::discovery::DiscoveredServer;
 use crate::models::{
     ClientCapabilities, ClientRegisterRequest, ClientStatusRequest, DesiredConfig, DeviceCommand,
-    OutputDeviceInfo,
+    OutputDeviceInfo, SourceCommand,
 };
 use crate::server_api::ServerApi;
 use crate::supervisor::SupervisorContext;
@@ -376,6 +376,11 @@ async fn status_loop(
                     }
                     hooks.command(&command.command, &command.args).await;
                 }
+                // Transport for the gear on an input goes to that input's own hook, so the script
+                // that speaks to a BeoSound is configured with the input rather than with the box.
+                for command in &desired.source_commands {
+                    run_source_command(&desired, command).await;
+                }
                 if desired_tx.send(desired).is_err() {
                     // Nobody left to act on it.
                     return;
@@ -452,6 +457,43 @@ async fn handle_builtin_command(command: &DeviceCommand, statuses: &status::Regi
         }
         _ => false,
     }
+}
+
+/// Hand one transport command to the hook of the source it names.
+///
+/// Silence here is a command that reaches nothing, so a source without a hook says so once rather
+/// than leaving someone pressing a button that is quietly discarded.
+async fn run_source_command(desired: &DesiredConfig, command: &SourceCommand) {
+    let Some(source) = desired
+        .sources
+        .iter()
+        .find(|source| source.client_id == command.client_id)
+    else {
+        warn!(
+            "command {} is for input {}, which this device does not have",
+            command.command, command.client_id
+        );
+        return;
+    };
+    let Some(hook) = source
+        .control_hook
+        .as_deref()
+        .map(str::trim)
+        .filter(|hook| !hook.is_empty())
+    else {
+        warn!(
+            "input {} has no control hook, so {} goes nowhere",
+            command.client_id, command.command
+        );
+        return;
+    };
+    info!(
+        "input {}: {} {}",
+        command.client_id,
+        command.command,
+        command.args.join(" ")
+    );
+    hooks::run_control_hook(hook, &command.command, &command.args).await;
 }
 
 fn hash_outputs(outputs: &[OutputDeviceInfo]) -> u64 {
