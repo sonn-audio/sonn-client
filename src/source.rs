@@ -13,6 +13,7 @@
 use crate::models::DesiredSource;
 use crate::status::{SourceHandle, STATE_CONNECTED, STATE_CONNECTING, STATE_IDLE, STATE_STREAMING};
 use anyhow::{anyhow, Result};
+use cpal::traits::DeviceTrait;
 use sendspin::audio::devices::find_input_device;
 use sendspin::protocol::messages::SourceSignal;
 use sendspin::source::{ConnectionState, Source, SourceConfig, SourceStatus};
@@ -20,11 +21,18 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-/// Capture defaults when the server names none. 48 kHz/16-bit stereo is what every USB interface and
-/// every Pi HAT does without argument.
+/// Capture defaults when the server names none. 48 kHz stereo is what every USB interface and every
+/// Pi HAT does without argument.
 pub const DEFAULT_SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_CHANNELS: u8 = 2;
-pub const DEFAULT_BIT_DEPTH: u8 = 16;
+/// 24-bit, because that is what the converters in these devices actually are.
+///
+/// A line input is levelled with headroom so peaks cannot clip, which means a good part of the range
+/// goes unused by design -- and taking 16 bits off a 24-bit converter spends that headroom twice.
+/// The extra byte costs 0.8 Mbit/s on a wired LAN and nothing in CPU: the capture path packs what
+/// the device hands it. A device that only offers 16 still gets 16; this is the ceiling, not a
+/// demand.
+pub const DEFAULT_BIT_DEPTH: u8 = 24;
 /// PCM by default. The server transcodes centrally anyway, and encoding on the device would spend a
 /// Pi's CPU to save bandwidth on a LAN that has plenty.
 pub const DEFAULT_CODEC: &str = "pcm";
@@ -68,31 +76,112 @@ impl SignalSettings {
 pub fn build(desired: &DesiredSource, name: String) -> Result<Source> {
     let mut config = SourceConfig::new(desired.client_id.clone(), name);
 
+    let mut device = None;
     if let Some(id) = desired
         .input
         .as_deref()
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        config.device =
-            Some(find_input_device(id).map_err(|err| anyhow!("capture device {}: {}", id, err))?);
+        let found = find_input_device(id).map_err(|err| anyhow!("capture device {}: {}", id, err))?;
+        device = Some(found.clone());
+        config.device = Some(found);
     }
+
+    // What the hardware can do, unless the server insists otherwise.
+    //
+    // There is no negotiation in the protocol: a source announces its input format and the server
+    // takes it. So the device is the one to ask -- it is the only party that knows what its
+    // converter is. A number configured elsewhere is a guess, and the guess that was there recorded
+    // a 24-bit converter in 16 bits.
+    let best = device.as_ref().map(best_input_format);
 
     config.codec = desired
         .codec
         .clone()
         .unwrap_or_else(|| DEFAULT_CODEC.to_string());
-    config.sample_rate = desired.sample_rate.unwrap_or(DEFAULT_SAMPLE_RATE);
-    config.bit_depth = desired.bit_depth.unwrap_or(DEFAULT_BIT_DEPTH);
+    config.sample_rate = desired
+        .sample_rate
+        .or(best.map(|best| best.sample_rate))
+        .unwrap_or(DEFAULT_SAMPLE_RATE);
+    config.bit_depth = desired
+        .bit_depth
+        .or(best.map(|best| best.bit_depth))
+        .unwrap_or(DEFAULT_BIT_DEPTH);
     config.channels = desired
         .channels
         .and_then(|channels| u8::try_from(channels).ok())
+        .or(best.map(|best| best.channels))
         .unwrap_or(DEFAULT_CHANNELS);
+    info!(
+        "capturing {} at {} Hz, {}-bit, {}ch",
+        desired.input.as_deref().unwrap_or("the default input"),
+        config.sample_rate,
+        config.bit_depth,
+        config.channels
+    );
     // Only claimed because this client does watch the level. A source that advertises the feature
     // and then never reports leaves the server waiting on a promise.
     config.line_sense = true;
 
     Ok(Source::new(config))
+}
+
+/// The best a capture device says it can do.
+#[derive(Clone, Copy)]
+struct InputFormat {
+    sample_rate: u32,
+    bit_depth: u8,
+    channels: u8,
+}
+
+/// Ask the device what it offers and take the best of it.
+///
+/// Deepest first, because that is where the quality is; 48 kHz where the device allows it, since
+/// everything downstream runs at 48 and resampling a line input buys nothing. Stereo unless the
+/// device is mono.
+fn best_input_format(device: &cpal::Device) -> InputFormat {
+    let mut best = InputFormat {
+        sample_rate: DEFAULT_SAMPLE_RATE,
+        bit_depth: DEFAULT_BIT_DEPTH,
+        channels: DEFAULT_CHANNELS,
+    };
+    let Ok(configs) = device.supported_input_configs() else {
+        return best;
+    };
+    let mut depth = 0;
+    let mut channels = 0;
+    let mut rate = 0;
+    for config in configs {
+        let candidate = match config.sample_format() {
+            cpal::SampleFormat::I16 | cpal::SampleFormat::U16 => 16,
+            cpal::SampleFormat::I24 | cpal::SampleFormat::U24 => 24,
+            // 32-bit converters are 24-bit converters in a wider frame; sending 32 would be four
+            // bytes to carry three bytes of signal.
+            _ => 24,
+        };
+        let fits_48k = config.min_sample_rate() <= DEFAULT_SAMPLE_RATE
+            && DEFAULT_SAMPLE_RATE <= config.max_sample_rate();
+        let candidate_rate = if fits_48k {
+            DEFAULT_SAMPLE_RATE
+        } else {
+            config.max_sample_rate()
+        };
+        let candidate_channels = u8::try_from(config.channels()).unwrap_or(DEFAULT_CHANNELS);
+        if (candidate, candidate_channels.min(DEFAULT_CHANNELS), candidate_rate)
+            > (depth, channels.min(DEFAULT_CHANNELS), rate)
+        {
+            depth = candidate;
+            channels = candidate_channels;
+            rate = candidate_rate;
+            best = InputFormat {
+                sample_rate: candidate_rate,
+                bit_depth: candidate,
+                channels: candidate_channels.min(DEFAULT_CHANNELS).max(1),
+            };
+        }
+    }
+    best
 }
 
 /// Run one source until it is told to stop, deciding signal presence as the levels come in.
