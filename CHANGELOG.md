@@ -1,3 +1,10 @@
+## [1.4.1](https://github.com/sonn-audio/sonn-client/compare/v1.4.0...v1.4.1) (2026-08-12)
+
+
+### Bug Fixes
+
+* **pairing:** actually scan, and wait for each step to answer ([a4ec7f3](https://github.com/sonn-audio/sonn-client/commit/a4ec7f344d531470b545afc229f2fa4b23dec15f))
+
 # [1.4.0](https://github.com/sonn-audio/sonn-client/compare/v1.3.0...v1.4.0) (2026-08-12)
 
 
