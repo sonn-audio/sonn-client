@@ -14,10 +14,9 @@
 
 use crate::models::PairingStatusReport;
 use crate::status::Registry;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tracing::{info, warn};
 
@@ -26,6 +25,10 @@ const DEFAULT_WINDOW: Duration = Duration::from_secs(90);
 /// B&O remotes advertise with this name prefix, which is also what the daemon's legacy-GATT check
 /// looks for.
 const REMOTE_NAME_PREFIX: &str = "BEORC";
+/// How long to wait for the adapter to answer a pairing request.
+const PAIR_TIMEOUT_S: u64 = 30;
+/// How long to wait for the first connection. Short: it is a courtesy, not the pairing.
+const CONNECT_TIMEOUT_S: u64 = 15;
 
 /// Open a pairing window and report what happened.
 ///
@@ -44,7 +47,7 @@ pub async fn pair_remote(
     }));
     info!("pairing window open for {}s", window.as_secs());
 
-    let result = tokio::time::timeout(window, run_pairing(address.clone())).await;
+    let result = tokio::time::timeout(window, run_pairing(address.clone(), window)).await;
     let report = match result {
         Ok(Ok(paired)) => {
             info!("paired {} ({:?})", paired.address, paired.name);
@@ -88,40 +91,106 @@ struct PairedDevice {
     name: Option<String>,
 }
 
-async fn run_pairing(address: Option<String>) -> Result<PairedDevice> {
+async fn run_pairing(address: Option<String>, window: Duration) -> Result<PairedDevice> {
     let target = match address {
         Some(address) => PairedDevice {
             address,
             name: None,
         },
-        None => discover_remote().await?,
+        None => discover_remote(window).await?,
     };
 
-    // One session for all three steps: the agent `bluetoothctl` registers lives only as long as it
-    // runs, and pairing without one fails with "No agent available".
-    let script = format!(
-        "agent NoInputNoOutput\ndefault-agent\npair {addr}\ntrust {addr}\nconnect {addr}\nquit\n",
-        addr = target.address
-    );
-    let output = feed_bluetoothctl(&script).await?;
-    let text = String::from_utf8_lossy(&output);
-    if !(text.contains("Pairing successful") || text.contains("already paired")) {
+    // Three separate one-shot calls with a timeout each, rather than one script.
+    //
+    // Pairing is asynchronous: bluetoothctl accepts `pair` and the result arrives later, so a script
+    // that sends pair, trust, connect and quit back to back can quit before the pairing it asked for
+    // has been answered. `--timeout` is what makes each call wait for its own result.
+    let addr = target.address.as_str();
+    let paired = run_bluetoothctl(&[
+        "--timeout".to_string(),
+        PAIR_TIMEOUT_S.to_string(),
+        "pair".to_string(),
+        addr.to_string(),
+    ])
+    .await?;
+    if !(paired.contains("Pairing successful") || paired.contains("already paired")) {
         anyhow::bail!(
             "bluetoothctl did not report a successful pairing: {}",
-            last_lines(&text, 5)
+            last_lines(&paired, 5)
         );
     }
+
+    // Without this a remote works exactly once: every reconnect wants authorising again, and
+    // nothing on the remote says so -- it simply stops responding after a while.
+    let trusted = run_bluetoothctl(&["trust".to_string(), addr.to_string()]).await?;
+    if !trusted.contains("trust succeeded") {
+        warn!(
+            "{} was paired but not trusted: {}",
+            addr,
+            last_lines(&trusted, 2)
+        );
+    }
+
+    // Connecting is a courtesy: the remote reconnects by itself once it is trusted, and a failure
+    // here is not a failed pairing.
+    if let Err(err) = run_bluetoothctl(&[
+        "--timeout".to_string(),
+        CONNECT_TIMEOUT_S.to_string(),
+        "connect".to_string(),
+        addr.to_string(),
+    ])
+    .await
+    {
+        info!(
+            "{} is paired; it will connect when it is used ({:#})",
+            addr, err
+        );
+    }
+
     Ok(target)
 }
 
 /// Watch for a remote advertising itself and return the first one.
-async fn discover_remote() -> Result<PairedDevice> {
-    // Scanning and reading the device list in one session: `devices` on a fresh session only shows
-    // what is already known, and a remote in pairing mode usually is not.
-    let output = feed_bluetoothctl("scan on\n").await?;
-    let text = String::from_utf8_lossy(&output);
-    for line in text.lines() {
-        // "[NEW] Device 48:D0:CF:9D:36:7D BEORC-1234"
+async fn discover_remote(window: Duration) -> Result<PairedDevice> {
+    // A remote that has been seen before is already in the adapter's list and may not advertise
+    // again, so the cheap answer comes first.
+    if let Some(found) = find_remote(&run_bluetoothctl(&["devices".to_string()]).await?) {
+        info!("{} is already known to the adapter", found.address);
+        return Ok(found);
+    }
+
+    // `--timeout` rather than feeding `scan on` to a session: bluetoothctl reads its commands from
+    // stdin, and closing stdin -- which is what happens the moment the script is written -- makes it
+    // exit. That is how this scanned for fourteen milliseconds and reported that nothing was
+    // advertising.
+    let seconds = window.as_secs().clamp(5, 60);
+    info!("scanning {}s for a {}* remote", seconds, REMOTE_NAME_PREFIX);
+    let scanned = run_bluetoothctl(&[
+        "--timeout".to_string(),
+        seconds.to_string(),
+        "scan".to_string(),
+        "on".to_string(),
+    ])
+    .await?;
+
+    find_remote(&scanned).ok_or_else(|| {
+        anyhow!(
+            "no {}* device advertised in {}s -- hold the remote's centre and back buttons until its \
+             screen says it is pairing",
+            REMOTE_NAME_PREFIX,
+            seconds
+        )
+    })
+}
+
+/// Pick a Beoremote out of whatever bluetoothctl printed.
+///
+/// Both `devices` and a scan use the same line shape, so one parser covers listing and discovery:
+/// `[NEW] Device 48:D0:CF:9D:36:7D BEORC-1234`.
+fn find_remote(output: &str) -> Option<PairedDevice> {
+    for line in output.lines() {
+        // `continue`, not `?`: a listing starts with the adapter itself, and giving up on the first
+        // line without a device in it is how this found nothing on a scan that saw the remote.
         let Some(rest) = line.split("Device ").nth(1) else {
             continue;
         };
@@ -131,40 +200,34 @@ async fn discover_remote() -> Result<PairedDevice> {
         };
         let name = parts.collect::<Vec<_>>().join(" ");
         if name.to_uppercase().starts_with(REMOTE_NAME_PREFIX) {
-            return Ok(PairedDevice {
+            return Some(PairedDevice {
                 address: address.to_string(),
                 name: (!name.is_empty()).then_some(name),
             });
         }
     }
-    anyhow::bail!(
-        "no {}* device advertised while scanning",
-        REMOTE_NAME_PREFIX
-    )
+    None
 }
 
-/// Run `bluetoothctl` with a script on stdin. Scanning has no natural end, so the caller's timeout is
-/// what stops it -- killing the child on drop is what makes that safe.
-async fn feed_bluetoothctl(script: &str) -> Result<Vec<u8>> {
-    let mut child = Command::new("bluetoothctl")
-        .stdin(Stdio::piped())
+/// Run `bluetoothctl` with arguments and return what it printed.
+async fn run_bluetoothctl(args: &[String]) -> Result<String> {
+    let output = Command::new("bluetoothctl")
+        .args(args)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)
-        .spawn()
-        .context("start bluetoothctl (is bluez installed?)")?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(script.as_bytes())
-            .await
-            .context("write bluetoothctl script")?;
-        stdin.flush().await.ok();
-    }
-    let output = child
-        .wait_with_output()
+        .output()
         .await
-        .context("wait for bluetoothctl")?;
-    Ok(output.stdout)
+        .context("run bluetoothctl (is bluez installed?)")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "bluetoothctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 async fn bluetoothctl(args: &[&str]) -> Result<()> {
@@ -190,6 +253,26 @@ fn last_lines(text: &str, count: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_is_found_in_either_listing() {
+        // What a scan prints, and what `devices` prints for one already known. Same shape, so one
+        // parser covers "it is advertising now" and "we have seen it before".
+        let scanned = "[NEW] Controller AA:BB:CC:DD:EE:FF beosound9000\n                       [NEW] Device 11:22:33:44:55:66 Some Phone\n                       [NEW] Device 48:D0:CF:9D:36:7D BEORC-1234\n";
+        let found = find_remote(scanned).expect("the remote");
+        assert_eq!(found.address, "48:D0:CF:9D:36:7D");
+        assert_eq!(found.name.as_deref(), Some("BEORC-1234"));
+
+        let known = "Device 48:D0:CF:9D:36:7D BEORC-1234\n";
+        assert_eq!(
+            find_remote(known).expect("the remote").address,
+            "48:D0:CF:9D:36:7D"
+        );
+
+        // Anything else on the air is not a remote, however loudly it advertises.
+        assert!(find_remote("[NEW] Device 11:22:33:44:55:66 Some Phone\n").is_none());
+        assert!(find_remote("").is_none());
+    }
 
     #[test]
     fn the_tail_of_the_output_is_what_gets_reported() {
