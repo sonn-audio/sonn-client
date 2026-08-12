@@ -62,6 +62,9 @@ const RETRY_PAUSE: Duration = Duration::from_secs(3);
 /// more over it, so this waits for the remote to let go rather than counting seconds at it. The
 /// daemon keeps its connection anyway; this only matters for the one-shot command.
 const HOLD_AFTER_PAIRING: Duration = Duration::from_secs(120);
+/// How long to stay put before a disconnect counts as "the remote is finished". Its discovery of
+/// forty-odd characteristics takes twenty seconds and more, and the link dips once at the start.
+const HOLD_MINIMUM: Duration = Duration::from_secs(45);
 /// How often to look at what discovery has turned up. A remote advertises in short bursts, so this
 /// is deliberately quicker than a human notices.
 const POLL_INTERVAL: Duration = Duration::from_millis(400);
@@ -315,11 +318,19 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
 /// Stay out of the way until the remote has finished with us.
 async fn hold_until_the_remote_is_done(device: &DeviceProxy<'_>, address: &str) {
     info!("{address} is paired; holding the connection while it reads our service");
-    let deadline = tokio::time::Instant::now() + HOLD_AFTER_PAIRING;
+    let start = tokio::time::Instant::now();
+    let deadline = start + HOLD_AFTER_PAIRING;
     while tokio::time::Instant::now() < deadline {
+        sleep(POLL_INTERVAL).await;
+        // `Connected` dips to false for a moment right after pairing, while the link is brought up
+        // again encrypted. Leaving on that first dip hangs up on a remote that has only just started
+        // reading -- which is exactly what it reports as a failed pairing.
+        if start.elapsed() < HOLD_MINIMUM {
+            continue;
+        }
         match device.connected().await {
             Ok(false) => {
-                debug!("{address} disconnected on its own; done");
+                debug!("{address} disconnected on its own after {:?}; done", start.elapsed());
                 return;
             }
             Ok(true) => {}
@@ -328,7 +339,6 @@ async fn hold_until_the_remote_is_done(device: &DeviceProxy<'_>, address: &str) 
                 return;
             }
         }
-        sleep(POLL_INTERVAL).await;
     }
 }
 

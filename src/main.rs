@@ -61,7 +61,8 @@ const FEATURES: [&str; 3] = ["source", "beoremote", "components"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let (command, argument, log_level) = parse_args()?;
+    let (command, arguments, log_level) = parse_args()?;
+    let argument = arguments.first().cloned();
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(default_log_filter(
             command.as_deref(),
@@ -81,7 +82,7 @@ async fn main() -> Result<()> {
         }
         Some("devices") => devices::print_devices(),
         Some("install") => install::run_install().await,
-        Some("pair-remote") => run_pair_remote(argument).await,
+        Some("pair-remote") => run_pair_remote(argument, arguments.get(1).cloned()).await,
         Some("components") => {
             let status = components::inspect_bluetoothd();
             println!(
@@ -535,12 +536,21 @@ fn spawn_shutdown_handler(hooks: Arc<hooks::HookRunner>) {
     });
 }
 
-/// `sonn-client pair-remote [address]`, for pairing a Beoremote One by hand. The same flow the server
+/// `sonn-client pair-remote [address] [seconds]`, for pairing a Beoremote One by hand. The same flow the server
 /// triggers with a `pair_remote` command, so the button in the UI and the command line cannot drift.
-async fn run_pair_remote(address: Option<String>) -> Result<()> {
+async fn run_pair_remote(address: Option<String>, window: Option<String>) -> Result<()> {
     let statuses = status::Registry::new();
-    println!("Put the remote into pairing mode now.");
-    pairing::pair_remote(&statuses, address, None).await?;
+    // Optional, because a window is a matter of how far away the remote is and how long it takes to
+    // walk over to it -- not something a default can know.
+    let window = window
+        .as_deref()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+    println!(
+        "Put the remote into pairing mode now (waiting {}s).",
+        window.map(|window| window.as_secs()).unwrap_or(90)
+    );
+    pairing::pair_remote(&statuses, address, window).await?;
     match statuses.pairing() {
         Some(report) => {
             println!(
@@ -566,7 +576,7 @@ fn print_usage() {
     eprintln!("  sonn-client [--log-level <level>] [run]");
     eprintln!("  sonn-client install");
     eprintln!("  sonn-client devices");
-    eprintln!("  sonn-client pair-remote [address]");
+    eprintln!("  sonn-client pair-remote [address] [seconds]");
     eprintln!("  sonn-client components");
     eprintln!("  sonn-client --help");
     eprintln!("  sonn-client --version");
@@ -636,10 +646,10 @@ fn default_log_filter(command: Option<&str>, requested: Option<String>) -> Strin
     }
 }
 
-fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
+fn parse_args() -> Result<(Option<String>, Vec<String>, Option<String>)> {
     let mut args = std::env::args().skip(1);
     let mut command = None;
-    let mut argument = None;
+    let mut arguments: Vec<String> = Vec::new();
     let mut log_level = None;
 
     while let Some(arg) = args.next() {
@@ -656,12 +666,12 @@ fn parse_args() -> Result<(Option<String>, Option<String>, Option<String>)> {
         }
         if command.is_none() {
             command = Some(arg);
-        } else if argument.is_none() {
-            argument = Some(arg);
+        } else {
+            arguments.push(arg);
         }
     }
 
-    Ok((command, argument, log_level))
+    Ok((command, arguments, log_level))
 }
 
 #[cfg(test)]

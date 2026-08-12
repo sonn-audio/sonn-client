@@ -349,6 +349,11 @@ impl BeoremoteGatt {
     pub async fn register(writes: mpsc::Sender<Write>) -> Result<Self> {
         // A previous run that was killed rather than asked to stop leaves its application behind,
         // and bluez would then put ours above it -- at handles the remote does not know.
+        //
+        // NOT by restarting bluetoothd, which was tried and reverted: bluez does hand out fresh
+        // handles after a restart, but a Beoremote One whose link is cut that way stops advertising
+        // altogether and only comes back after a factory reset. Measured three times in one evening.
+        // Whatever the answer to the handles is, it cannot be that.
         unregister_leftovers().await;
 
         let connection = Connection::system()
