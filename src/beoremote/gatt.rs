@@ -21,7 +21,7 @@
 //!   we -- it costs nothing and a remote that reconnects finds what it remembers.
 
 use anyhow::{Context, Result};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -36,6 +36,17 @@ const APP_PATH: &str = "/sonn/beoremote";
 const SERVICE_PATH: &str = "/sonn/beoremote/service0";
 const DIS_PATH: &str = "/sonn/beoremote/service1";
 const ADAPTER_PATH: &str = "/org/bluez/hci0";
+/// Where the two services are asked to sit. Clear of anything bluez puts in the database itself,
+/// and far enough apart that the whole attribute table fits between them.
+const SERVICE_HANDLE: u16 = 0x0100;
+const DIS_HANDLE: u16 = 0x0200;
+/// Characteristics ask for nothing: `0x0000` means "allocate it", which is what bluez requires here.
+///
+/// Pinning them individually is refused -- a service owns one contiguous block of handles, and
+/// spaced-out requests fall outside it ("Failed to create characteristic entry in database"). It is
+/// also unnecessary: the block starts at the service's own pinned handle and is filled in the order
+/// the characteristics are registered, which is fixed in `REGISTRATION_ORDER`.
+const AUTO_HANDLE: u16 = 0x0000;
 /// How often to check that bluez is still there.
 const BLUEZ_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 /// The only attribute the remote subscribes to, and so the only one that needs a `Value` property.
@@ -165,6 +176,15 @@ pub type Write = (String, Vec<u8>);
 
 struct Service {
     uuid: String,
+    /// Where this service is asked to sit in bluez's database.
+    ///
+    /// bluez hands out handles from a counter that only ever goes up, so a service that is
+    /// registered again after a client restart lands somewhere new -- and a Beoremote One caches
+    /// handles and subscribes to nothing, not even Service Changed, so it goes on writing to where
+    /// the service used to be. Asking for a fixed handle is what keeps it in one place. bluez may
+    /// refuse if the range is taken, in which case it allocates as before and the remote has to be
+    /// paired again; there is nothing better available.
+    handle: u16,
 }
 
 #[interface(name = "org.bluez.GattService1")]
@@ -180,11 +200,24 @@ impl Service {
     fn primary(&self) -> bool {
         true
     }
+
+    #[zbus(property, name = "Handle")]
+    fn handle(&self) -> u16 {
+        self.handle
+    }
+
+    #[zbus(property, name = "Handle")]
+    fn set_handle(&mut self, handle: u16) {
+        // bluez writes back what it actually allocated.
+        self.handle = handle;
+    }
 }
 
 struct Characteristic {
     name: String,
     uuid: String,
+    /// Where this characteristic is asked to sit; see `Service::handle`.
+    handle: u16,
     service: OwnedObjectPath,
     flags: Vec<String>,
     values: Values,
@@ -212,6 +245,16 @@ impl Characteristic {
     #[zbus(property, name = "Flags")]
     fn flags(&self) -> Vec<String> {
         self.flags.clone()
+    }
+
+    #[zbus(property, name = "Handle")]
+    fn handle(&self) -> u16 {
+        self.handle
+    }
+
+    #[zbus(property, name = "Handle")]
+    fn set_handle(&mut self, handle: u16) {
+        self.handle = handle;
     }
 
     fn read_value(&self, options: HashMap<String, OwnedValue>) -> zbus::fdo::Result<Vec<u8>> {
@@ -291,6 +334,16 @@ impl NotifyingCharacteristic {
         self.inner.flags.clone()
     }
 
+    #[zbus(property, name = "Handle")]
+    fn handle(&self) -> u16 {
+        self.inner.handle
+    }
+
+    #[zbus(property, name = "Handle")]
+    fn set_handle(&mut self, handle: u16) {
+        self.inner.handle = handle;
+    }
+
     #[zbus(property, name = "Value")]
     fn value(&self) -> Vec<u8> {
         self.inner.stored()
@@ -349,6 +402,92 @@ pub async fn unregister_leftovers() {
     }
 }
 
+/// The application object, which is what bluez walks to find our services.
+///
+/// This answers `GetManagedObjects` itself instead of leaning on zbus's own object manager, for one
+/// reason: **order**. bluez numbers the attributes in the order it receives them, and zbus keeps its
+/// objects in a hash map, so every run handed them over in a different order and every restart gave
+/// the characteristics different handles -- measured as char21 at 258, char20 at 267, char00 at 285.
+/// The remote caches handles, so after a restart its menu picks went to whatever now sat where
+/// ACTIVE_SOURCE used to be. A `BTreeMap` keyed by object path is ordered, and the paths are padded
+/// (`char00`, `char01`, ...) so that order is the registration order.
+struct Application {
+    services: Vec<(OwnedObjectPath, String, u16)>,
+    characteristics: Vec<CharacteristicEntry>,
+}
+
+struct CharacteristicEntry {
+    path: OwnedObjectPath,
+    uuid: String,
+    service: OwnedObjectPath,
+    flags: Vec<String>,
+}
+
+type Properties = BTreeMap<String, OwnedValue>;
+type Interfaces = BTreeMap<String, Properties>;
+
+/// An object path that can be a `BTreeMap` key.
+///
+/// `OwnedObjectPath` deliberately does not order, and the ordering is the entire point here: it is
+/// what decides the order bluez receives the attributes in, and therefore which handles they get.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PathKey(String);
+
+impl zbus::zvariant::Type for PathKey {
+    const SIGNATURE: &'static zbus::zvariant::Signature =
+        <ObjectPath<'_> as zbus::zvariant::Type>::SIGNATURE;
+}
+
+impl serde::Serialize for PathKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ObjectPath::try_from(self.0.as_str())
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
+impl From<&OwnedObjectPath> for PathKey {
+    fn from(path: &OwnedObjectPath) -> Self {
+        PathKey(path.as_str().to_string())
+    }
+}
+
+#[interface(name = "org.freedesktop.DBus.ObjectManager")]
+impl Application {
+    fn get_managed_objects(&self) -> zbus::fdo::Result<BTreeMap<PathKey, Interfaces>> {
+        let mut objects: BTreeMap<PathKey, Interfaces> = BTreeMap::new();
+        for (path, uuid, handle) in &self.services {
+            let mut properties = Properties::new();
+            properties.insert("UUID".to_string(), value(uuid.as_str())?);
+            properties.insert("Primary".to_string(), value(true)?);
+            properties.insert("Handle".to_string(), value(*handle)?);
+            objects.insert(
+                PathKey::from(path),
+                Interfaces::from([("org.bluez.GattService1".to_string(), properties)]),
+            );
+        }
+        for entry in &self.characteristics {
+            let mut properties = Properties::new();
+            properties.insert("UUID".to_string(), value(entry.uuid.as_str())?);
+            properties.insert("Service".to_string(), value(entry.service.clone())?);
+            properties.insert("Flags".to_string(), value(entry.flags.clone())?);
+            // Asked for as "allocate one", which is what bluez requires inside a service; it writes
+            // back what it chose, and that is what makes the layout checkable from the outside.
+            properties.insert("Handle".to_string(), value(AUTO_HANDLE)?);
+            objects.insert(
+                PathKey::from(&entry.path),
+                Interfaces::from([("org.bluez.GattCharacteristic1".to_string(), properties)]),
+            );
+        }
+        Ok(objects)
+    }
+}
+
+fn value<'a, T: Into<zbus::zvariant::Value<'a>>>(from: T) -> zbus::fdo::Result<OwnedValue> {
+    OwnedValue::try_from(from.into())
+        .map_err(|err| zbus::fdo::Error::Failed(format!("property: {err}")))
+}
+
 /// The service, registered with BlueZ for as long as this is alive.
 pub struct BeoremoteGatt {
     connection: Connection,
@@ -376,16 +515,17 @@ impl BeoremoteGatt {
         let values: Values = Arc::new(Mutex::new(HashMap::new()));
         let server = connection.object_server();
 
-        // BlueZ walks the application with ObjectManager, so the root has to answer for one.
-        server
-            .at(APP_PATH, zbus::fdo::ObjectManager)
-            .await
-            .context("serve the object manager")?;
+        // Built up in registration order and handed to bluez in that order; see `Application`.
+        let mut listing = Application {
+            services: Vec::new(),
+            characteristics: Vec::new(),
+        };
         server
             .at(
                 SERVICE_PATH,
                 Service {
                     uuid: uuid_for(0),
+                    handle: SERVICE_HANDLE,
                 },
             )
             .await
@@ -395,6 +535,7 @@ impl BeoremoteGatt {
                 DIS_PATH,
                 Service {
                     uuid: DIS_UUID.to_string(),
+                    handle: DIS_HANDLE,
                 },
             )
             .await
@@ -402,6 +543,12 @@ impl BeoremoteGatt {
 
         let service_path = OwnedObjectPath::try_from(SERVICE_PATH)?;
         let dis_path = OwnedObjectPath::try_from(DIS_PATH)?;
+        listing
+            .services
+            .push((service_path.clone(), uuid_for(0), SERVICE_HANDLE));
+        listing
+            .services
+            .push((dis_path.clone(), DIS_UUID.to_string(), DIS_HANDLE));
         let mut paths = HashMap::new();
 
         for (index, (name, flags)) in REGISTRATION_ORDER.iter().enumerate() {
@@ -418,6 +565,7 @@ impl BeoremoteGatt {
             let characteristic = Characteristic {
                 name: (*name).to_string(),
                 uuid: uuid_for(number),
+                handle: AUTO_HANDLE,
                 service: service_path.clone(),
                 flags: flags
                     .iter()
@@ -442,6 +590,15 @@ impl BeoremoteGatt {
                     .await
                     .with_context(|| format!("serve characteristic {name}"))?;
             }
+            listing.characteristics.push(CharacteristicEntry {
+                path: path.clone(),
+                uuid: uuid_for(number),
+                service: service_path.clone(),
+                flags: flags
+                    .iter()
+                    .flat_map(|flag| flag.as_strs().iter().map(|name| (*name).to_string()))
+                    .collect(),
+            });
             paths.insert((*name).to_string(), path);
         }
 
@@ -465,6 +622,7 @@ impl BeoremoteGatt {
                     Characteristic {
                         name: name.to_string(),
                         uuid: uuid.to_string(),
+                        handle: AUTO_HANDLE,
                         service: dis_path.clone(),
                         flags: vec!["read".to_string()],
                         values: Arc::clone(&values),
@@ -473,8 +631,19 @@ impl BeoremoteGatt {
                 )
                 .await
                 .with_context(|| format!("serve {name}"))?;
+            listing.characteristics.push(CharacteristicEntry {
+                path: path.clone(),
+                uuid: uuid.to_string(),
+                service: dis_path.clone(),
+                flags: vec![Flag::Read.as_strs()[0].to_string()],
+            });
             paths.insert(name.to_string(), path);
         }
+
+        server
+            .at(APP_PATH, listing)
+            .await
+            .context("serve the application")?;
 
         let manager = GattManagerProxy::builder(&connection)
             .path(ADAPTER_PATH)?
