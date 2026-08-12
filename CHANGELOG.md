@@ -1,3 +1,10 @@
+# [1.2.0](https://github.com/sonn-audio/sonn-client/compare/v1.1.0...v1.2.0) (2026-08-12)
+
+
+### Bug Fixes
+
+* **ci:** stop a release that was never cut from replacing the last one ([8f97d85](https://github.com/sonn-audio/sonn-client/commit/8f97d85c6be285af842a931aecd768240083eb52))
+
 # [1.1.0](https://github.com/sonn-audio/sonn-client/compare/v1.0.8...v1.1.0) (2026-08-01)
 
 
