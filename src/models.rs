@@ -43,7 +43,7 @@ pub struct ClientCapabilities {
 /// A component this device manages on the server's behalf — software that is not part of the client
 /// binary but has to be present for a feature to work.
 ///
-/// Only one so far: `beoremote-bluetoothd`, B&O's patched BlueZ 5.45, which is what makes a Beoremote
+/// Only one so far: `sonn-beoremote`, B&O's patched BlueZ 5.45, which is what makes a Beoremote
 /// One serve menus instead of acting like a keyboard. It is GPLv2 and it is a whole daemon, so it is
 /// fetched as its own artifact rather than linked into this binary.
 #[derive(Debug, Clone, Serialize)]
@@ -300,7 +300,7 @@ pub struct DesiredSource {
 
 /// Beoremote One support for this device.
 ///
-/// The remote talks to a patched `bluetoothd` (the `beoremote-bluetoothd` component) over two unix
+/// The remote talks to a patched `bluetoothd` (the `sonn-beoremote` component) over two unix
 /// sockets; this client fills the menus from the server and forwards what the user picks. The menu
 /// itself is entirely the server's: a new playlist appears on the remote with nothing deployed here.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -333,12 +333,12 @@ pub struct DesiredBeoremote {
 
 /// Software the server wants present on this device.
 ///
-/// Kept out of the client binary on purpose. `beoremote-bluetoothd` is GPLv2 (B&O publish their
+/// Kept out of the client binary on purpose. `sonn-beoremote` is GPLv2 (B&O publish their
 /// BlueZ patches because they must), and linking a GPL daemon into this binary would relicense the
 /// lot. It is also dead weight on the devices that have no B&O remote.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DesiredComponent {
-    /// Known name: `beoremote-bluetoothd`. Anything else is refused rather than guessed at.
+    /// Known name: `sonn-beoremote`. Anything else is refused rather than guessed at.
     pub name: String,
     /// Version the server wants installed. A mismatch with what is here triggers a fetch.
     #[serde(default)]

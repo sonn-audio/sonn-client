@@ -1,6 +1,6 @@
 //! Software this device manages on the server's behalf.
 //!
-//! There is exactly one so far: `beoremote-bluetoothd`, Bang & Olufsen's patched BlueZ 5.45. It is
+//! There is exactly one so far: `sonn-beoremote`, our build of Bang & Olufsen's patched BlueZ 5.45. It is
 //! what turns a Beoremote One from a keyboard into something that serves menus, and it cannot be part
 //! of this binary for two reasons that both matter. It is **GPLv2** -- B&O publish their patches
 //! because BlueZ leaves them no choice, and linking a GPL daemon into this client would relicense the
@@ -27,12 +27,12 @@ use tracing::{info, warn};
 
 /// The only component this build knows how to install. Anything else is refused rather than guessed
 /// at: this installs a daemon that takes over the Bluetooth adapter.
-pub const BEOREMOTE_BLUETOOTHD: &str = "beoremote-bluetoothd";
+pub const SONN_BEOREMOTE: &str = "sonn-beoremote";
 
 const INSTALL_ROOT: &str = "/opt/beocore";
 const STATE_DIR: &str = "/var/lib/sonn-client/components";
-const UNIT_PATH: &str = "/etc/systemd/system/beoremote-bluetoothd.service";
-const SERVICE_NAME: &str = "beoremote-bluetoothd";
+const UNIT_PATH: &str = "/etc/systemd/system/sonn-beoremote.service";
+const SERVICE_NAME: &str = "sonn-beoremote";
 
 pub const STATE_ABSENT: &str = "absent";
 pub const STATE_INSTALLED: &str = "installed";
@@ -56,7 +56,7 @@ pub async fn reconcile(desired: &[DesiredComponent], busy: bool) -> Vec<Componen
             reports.push(crate::update::reconcile(component, busy).await);
             continue;
         }
-        if component.name != BEOREMOTE_BLUETOOTHD {
+        if component.name != SONN_BEOREMOTE {
             reports.push(ComponentStatus {
                 name: component.name.clone(),
                 version: None,
@@ -79,11 +79,11 @@ pub async fn reconcile(desired: &[DesiredComponent], busy: bool) -> Vec<Componen
 
 /// Current state of the B&O daemon on this device, without touching anything.
 pub fn inspect_bluetoothd() -> ComponentStatus {
-    let installed = installed_version(BEOREMOTE_BLUETOOTHD);
+    let installed = installed_version(SONN_BEOREMOTE);
     let binary = PathBuf::from(INSTALL_ROOT).join("libexec/bluetoothd");
     if !binary.exists() {
         return ComponentStatus {
-            name: BEOREMOTE_BLUETOOTHD.to_string(),
+            name: SONN_BEOREMOTE.to_string(),
             version: None,
             state: STATE_ABSENT.to_string(),
             last_error: None,
@@ -95,7 +95,7 @@ pub fn inspect_bluetoothd() -> ComponentStatus {
         STATE_INSTALLED
     };
     ComponentStatus {
-        name: BEOREMOTE_BLUETOOTHD.to_string(),
+        name: SONN_BEOREMOTE.to_string(),
         version: installed,
         state: state.to_string(),
         last_error: None,
@@ -258,7 +258,7 @@ fn remove_bluetoothd() -> Result<()> {
     if binary.exists() {
         fs::remove_file(&binary).with_context(|| format!("remove {}", binary.display()))?;
     }
-    let _ = fs::remove_file(version_file(BEOREMOTE_BLUETOOTHD));
+    let _ = fs::remove_file(version_file(SONN_BEOREMOTE));
     // Deliberately left alone: /var/lib/bluetooth holds the pairings. Removing the daemon should not
     // make the user re-pair a remote when it is put back.
     let _ = run("systemctl", &["enable", "--now", "bluetooth.service"]);
@@ -279,7 +279,7 @@ fn start_service() -> Result<()> {
 fn systemd_unit() -> String {
     [
         "[Unit]",
-        "Description=BlueZ 5.45 with the BeoRemote One plugin (managed by sonn-client)",
+        "Description=Sonn BeoRemote One support (B&O's patched BlueZ 5.45, managed by sonn-client)",
         "Documentation=https://github.com/bang-olufsen/gpl",
         "Conflicts=bluetooth.service",
         "After=dbus.service",
