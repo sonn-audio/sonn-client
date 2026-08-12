@@ -22,7 +22,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 #
 # Each of those is a single-purpose branch of its own for upstream; `sonn` is where they are combined
 # so this client can depend on one thing. Point this at a version once they land.
-sendspin = { git = "https://github.com/sonn-audio/sendspin-rs.git", branch = "sonn" }
+sendspin = { git = "https://github.com/sonn-audio/sendspin-rs.git", branch = "sonn", features = [
+    "hardware-volume",
+] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"

@@ -14,7 +14,6 @@
 //! A failing hook is logged and swallowed. None of them may take audio down with them.
 
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
 use tokio::process::Command;
 use tracing::{debug, info, warn};
 
@@ -62,70 +61,6 @@ impl HookRunner {
         };
         info!("running command hook: {} {}", trimmed, args.join(" "));
         run(shell_argv(script, trimmed, args), "command").await;
-    }
-}
-
-/// Hardware volume for one player.
-///
-/// Holds the last level it sent so a repeated command -- the server resends volume on every session
-/// start -- does not re-drive an amplifier that is already at the right level.
-#[derive(Clone)]
-pub struct VolumeHook {
-    command: String,
-    last_sent: Arc<Mutex<Option<u8>>>,
-}
-
-impl VolumeHook {
-    pub fn new(command: String) -> Self {
-        Self {
-            command,
-            last_sent: Arc::new(Mutex::new(None)),
-        }
-    }
-
-    /// Apply level/mute as one effective value, the way the reference client does: muted is 0, and
-    /// the logical volume behind it stays the server's business.
-    pub async fn apply(&self, volume: u8, muted: bool) {
-        let effective = if muted { 0 } else { volume.min(100) };
-        {
-            let Ok(mut last) = self.last_sent.lock() else {
-                return;
-            };
-            if *last == Some(effective) {
-                return;
-            }
-            *last = Some(effective);
-        }
-        debug!("running volume hook with effective level {}", effective);
-        run(
-            shell_argv(&self.command, &effective.to_string(), &[]),
-            "volume",
-        )
-        .await;
-    }
-}
-
-/// Transport controls for the device wired to a source input.
-///
-/// The server decides *when* — it is the only party that knows a zone is listening to this input —
-/// and this runs whatever turns that into something the hardware understands: a MasterLink telegram
-/// for a BeoSound 9000, a GPIO for a relay, an IR blast. `activate` matters most: an input nobody
-/// switched on produces silence, and silence is indistinguishable from "not playing".
-#[derive(Clone)]
-pub struct ControlHook {
-    command: String,
-}
-
-impl ControlHook {
-    pub fn new(command: String) -> Self {
-        Self { command }
-    }
-
-    /// Run the hook as `<script> <control>`, with the control name passed through untouched so the
-    /// server can add to the vocabulary without a client release.
-    pub async fn run(&self, control: &str) {
-        info!("running source control hook: {}", control);
-        run(shell_argv(&self.command, control, &[]), "source control").await;
     }
 }
 

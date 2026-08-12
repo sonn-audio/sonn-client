@@ -5,6 +5,9 @@
 //! `alsa:hw:CARD=DAC,DEV=0` -- because it has to survive a round trip through the server's config
 //! and still resolve months later. Treat it as opaque: it is cpal's spelling, not ALSA's.
 //!
+//! Resolving an id back to a card is the crate's (`sendspin::audio::devices`); what is here is the
+//! offer, which is this client's contract with its server rather than anything the protocol knows.
+//!
 //! Everything a device says about itself is best-effort. A card that refuses to enumerate its
 //! configs is skipped rather than reported as broken; nothing here may fail the whole listing. What
 //! it does do is say *why* at debug level -- a card that quietly fails to appear is otherwise only
@@ -230,66 +233,6 @@ fn drop_numeric_card_duplicates(devices: &mut Vec<OutputDeviceInfo>) {
         }
         !has_named_twin
     });
-}
-
-/// Resolve a capture device the server named.
-pub fn find_input_device(query: &str) -> Option<cpal::Device> {
-    find_device(query, false)
-}
-
-/// Resolve what the server asked for back to a device.
-///
-/// Accepts a cpal device id (what we reported), a description, or an index into the listing -- the
-/// last two so `--audio-device` stays usable by hand while troubleshooting.
-pub fn find_output_device(query: &str) -> Option<cpal::Device> {
-    find_device(query, true)
-}
-
-fn find_device(query: &str, output: bool) -> Option<cpal::Device> {
-    let trimmed = query.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let wanted_index = trimmed.parse::<usize>().ok();
-    let mut index = 0usize;
-
-    for host_id in cpal::available_hosts() {
-        let Ok(host) = cpal::host_from_id(host_id) else {
-            continue;
-        };
-        let Ok(devices) = host.devices() else {
-            continue;
-        };
-        for device in devices {
-            let usable = if output {
-                device.supports_output()
-            } else {
-                device.supports_input()
-            };
-            if !usable {
-                continue;
-            }
-            if let Some(wanted) = wanted_index {
-                if index == wanted {
-                    return Some(device);
-                }
-            } else {
-                let id_matches = device
-                    .id()
-                    .map(|id| id.to_string() == trimmed)
-                    .unwrap_or(false);
-                let description_matches = device
-                    .description()
-                    .map(|description| description.name() == trimmed)
-                    .unwrap_or(false);
-                if id_matches || description_matches {
-                    return Some(device);
-                }
-            }
-            index += 1;
-        }
-    }
-    None
 }
 
 /// Print the listing for `sonn-client devices`, so an installer can see what the server will offer.

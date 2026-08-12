@@ -407,6 +407,30 @@ pub enum VolumeControl {
 }
 
 impl DesiredPlayer {
+    /// A player with nothing configured, for tests that care about one field at a time.
+    #[cfg(test)]
+    pub fn named(client_id: &str) -> Self {
+        Self {
+            client_id: client_id.to_string(),
+            name: None,
+            output: None,
+            enabled: None,
+            codecs: None,
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            static_delay_ms: None,
+            volume: None,
+            muted: None,
+            buffer_ms: None,
+            required_lead_time_ms: None,
+            volume_hook: None,
+            volume_control: None,
+            mixer_element: None,
+            mixer_mapped: None,
+        }
+    }
+
     pub fn volume_control(&self) -> VolumeControl {
         match self
             .volume_control

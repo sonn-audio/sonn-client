@@ -8,7 +8,6 @@
 //! one, and no one has to SSH into a Pi to change a setting.
 
 mod alsa_quiet;
-mod alsa_volume;
 mod beoremote;
 mod components;
 mod config;
@@ -421,10 +420,7 @@ fn build_register_request(
         outputs: outputs.to_vec(),
         inputs: inputs.to_vec(),
         capabilities: ClientCapabilities {
-            codecs: player::SUPPORTED_CODECS
-                .iter()
-                .map(|codec| codec.to_string())
-                .collect(),
+            codecs: player::supported_codecs(),
             max_players: MAX_PLAYERS,
             features: FEATURES.iter().map(|entry| entry.to_string()).collect(),
         },

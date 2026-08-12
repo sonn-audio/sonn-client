@@ -316,10 +316,6 @@ impl PlayerHandle {
         }
     }
 
-    pub fn set_state(&self, state: &str) {
-        self.update(|snapshot| snapshot.state = state.to_string());
-    }
-
     /// Entering a state that means "working" also clears the last error: leaving it behind makes a
     /// recovered player look broken forever in the UI.
     pub fn set_state_ok(&self, state: &str) {
@@ -365,13 +361,6 @@ impl PlayerHandle {
     pub fn set_static_delay(&self, delay_ms: u16) {
         self.update(|snapshot| snapshot.static_delay_ms = delay_ms);
     }
-
-    pub fn set_clock(&self, rtt_ms: Option<f64>, quality: Option<String>) {
-        self.update(|snapshot| {
-            snapshot.clock_rtt_ms = rtt_ms;
-            snapshot.clock_quality = quality;
-        });
-    }
 }
 
 /// Writer for one source's row in the registry.
@@ -388,10 +377,6 @@ impl SourceHandle {
                 apply(snapshot);
             }
         }
-    }
-
-    pub fn set_state(&self, state: &str) {
-        self.update(|snapshot| snapshot.state = state.to_string());
     }
 
     pub fn set_state_ok(&self, state: &str) {
@@ -418,19 +403,11 @@ impl SourceHandle {
         });
     }
 
-    pub fn set_level(&self, level: f32) {
-        self.update(|snapshot| snapshot.level = Some(level));
-    }
-
     pub fn set_signal(&self, level: f32, signal: &str) {
         self.update(|snapshot| {
             snapshot.level = Some(level);
             snapshot.signal = Some(signal.to_string());
         });
-    }
-
-    pub fn set_clock(&self, rtt_ms: Option<f64>) {
-        self.update(|snapshot| snapshot.clock_rtt_ms = rtt_ms);
     }
 }
 
@@ -443,7 +420,7 @@ mod tests {
         let registry = Registry::new();
         let good = registry.handle("a", None, 100, false, 0);
         let bad = registry.handle("b", None, 100, false, 0);
-        good.set_state(STATE_STREAMING);
+        good.set_state_ok(STATE_STREAMING);
         bad.set_error("card busy");
         assert_eq!(registry.device_state(), STATE_STREAMING);
     }

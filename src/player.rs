@@ -1,51 +1,40 @@
-//! One Sendspin player: a socket, a decoder and a sound card.
+//! Turning what the server asked for into a Sendspin player.
 //!
-//! This is the only part of the client that talks the protocol, and it talks nothing else -- no
-//! AirPlay, no DLNA, no Bluetooth sink. Those all exist on this device too, but they live on the
-//! *server*, which converts them into a Sendspin stream aimed here. That is the whole point: one
-//! protocol on the device, one place where sync is solved.
+//! The session is the crate's. `sendspin::player::Player` owns the connection, the decoder, the
+//! card and the drift correction between them, and it reconnects on its own. What is left here is
+//! the half only this device can answer -- which card, whose volume, what the server decided to
+//! call this speaker -- and the bridge that turns what the player reports about itself into what
+//! this device reports upstream.
 //!
-//! Protocol, clock filter, decoders and the timestamp-scheduled cpal output come from the `sendspin`
-//! crate; what this module owns is the lifecycle -- how a stream's format change is applied, where
-//! volume goes, what gets reported, and when to give up and reconnect.
+//! What used to be here was a second implementation of the protocol living beside the crate's. It
+//! agreed with the server it was written against and with nothing else, which is exactly the kind
+//! of fault that stays invisible until there is another implementation to test against.
 
-use crate::alsa_volume::AlsaMixer;
-use crate::devices;
-use crate::hooks::VolumeHook;
 use crate::models::{DesiredPlayer, VolumeControl};
 use crate::status::{PlayerHandle, STATE_CONNECTED, STATE_CONNECTING, STATE_IDLE, STATE_STREAMING};
-use anyhow::{anyhow, Context, Result};
-use base64::prelude::*;
-use sendspin::audio::decode::{Decoder, FlacDecoder, OpusDecoder, PcmDecoder, PcmEndian};
-use sendspin::audio::{AudioBuffer, AudioFormat, Codec, SyncedPlayer, SyncedPlayerConfig};
-use sendspin::protocol::messages::{
-    AudioFormatSpec, ClientState, Message, PlayerCommand, PlayerCommandType, PlayerState,
-    PlayerStateCommand, PlayerV1Support,
-};
-use sendspin::{ProtocolClientBuilder, WsSender};
-use std::sync::Arc;
+use anyhow::{anyhow, Result};
+use sendspin::audio::devices::{find_device, output_rates};
+use sendspin::audio::Codec;
+use sendspin::hooks::Hooks;
+use sendspin::player::{CodecOffer, ConnectionState, Player, PlayerConfig, PlayerStatus};
+use sendspin::protocol::messages::AudioFormatSpec;
 use std::time::Duration;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
-/// Codecs this build can decode, best first. FLAC ahead of PCM so a busy wifi link carries lossless
-/// audio instead of 2.3 Mbit/s of raw samples; Opus last because it is the only lossy one.
-pub const SUPPORTED_CODECS: [&str; 3] = ["flac", "opus", "pcm"];
+/// Fallback when the server seeds no level: full, and let the first server command decide.
+const DEFAULT_VOLUME: u8 = 100;
+/// Channels to assume when a format is pinned without naming them. Stereo, like everything else.
+const DEFAULT_CHANNELS: u8 = 2;
+/// How long to wait before dialling again. The crate doubles this up to a minute.
+const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-/// Rates advertised when the server pins none. Both are here so the server's bit-perfect path can
-/// pass a 44.1 kHz album through untouched instead of resampling everything to 48.
-const DEFAULT_RATES: [u32; 2] = [48_000, 44_100];
-const DEFAULT_BIT_DEPTHS: [u8; 2] = [24, 16];
-const DEFAULT_CHANNELS: u16 = 2;
-const DEFAULT_BUFFER_MS: u32 = 500;
-const DEFAULT_LEAD_MS: u32 = 500;
-/// Room for a couple of seconds of 24-bit stereo, which is well past any lead the server asks for.
-const BUFFER_CAPACITY_BYTES: usize = 8 * 1024 * 1024;
-/// How often the clock lock is copied into the status report.
-const CLOCK_REPORT_INTERVAL: Duration = Duration::from_secs(1);
-
-/// What can change without dropping audio. Everything else lives in `PlayerParams` and a change
-/// there means a reconnect.
+/// What can change without rebuilding the player.
+///
+/// The level is here as well as in `client/hello`, because two things move it locally: the server
+/// changing the seed it configured, and a press on the remote wired to this speaker. Both go to the
+/// player the same way, and the crate decides where a level actually lands -- a script, the card's
+/// mixer, or its own gain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveSettings {
     pub volume: u8,
@@ -53,653 +42,339 @@ pub struct LiveSettings {
     pub static_delay_ms: u16,
 }
 
-#[derive(Debug, Clone)]
-pub struct PlayerParams {
-    pub url: String,
-    pub client_id: String,
-    pub name: String,
-    /// cpal device id to open. `None` means the host default.
-    pub output: Option<String>,
-    pub codecs: Vec<String>,
-    pub sample_rate: Option<u32>,
-    pub bit_depth: Option<u8>,
-    pub channels: Option<u16>,
-    pub buffer_ms: Option<u32>,
-    pub required_lead_time_ms: Option<u32>,
+impl LiveSettings {
+    pub fn from_desired(player: &DesiredPlayer) -> Self {
+        Self {
+            volume: player.volume.unwrap_or(DEFAULT_VOLUME).min(100),
+            muted: player.muted.unwrap_or(false),
+            static_delay_ms: player.static_delay_ms.unwrap_or(0),
+        }
+    }
 }
 
-/// Where a player's volume ends up.
+/// What this build can decode, for the capabilities this device reports to its server.
+pub fn supported_codecs() -> Vec<String> {
+    let mut codecs: Vec<String> = Vec::new();
+    for offer in CodecOffer::all() {
+        if !codecs.contains(&offer.codec) {
+            codecs.push(offer.codec);
+        }
+    }
+    codecs
+}
+
+/// Build a player for one desired speaker.
 ///
-/// Decided once when the player starts, because it depends on what the card turns out to be, and a
-/// speaker that moved its own volume yesterday should not be attenuating in software today.
-pub enum VolumeSink {
-    /// Gain in our own mixer. The fallback, not the preference: every dB taken here is resolution
-    /// the card would not have taken.
-    Software,
-    /// A script the server named. Highest precedence -- somebody wired this deliberately.
-    Hook(VolumeHook),
-    /// The card's own mixer.
-    Mixer(AlsaMixer),
-}
+/// Fails only where the device cannot do what was asked -- a named card that is not there. A missing
+/// mixer or an unusable hook is reported and stepped over, because software volume still plays.
+pub fn build(
+    desired: &DesiredPlayer,
+    name: String,
+    fallback_hook: Option<&str>,
+    settings: &LiveSettings,
+) -> Result<Player> {
+    let mut config = PlayerConfig::new(desired.client_id.clone(), name);
 
-impl VolumeSink {
-    pub async fn resolve(player: &DesiredPlayer, fallback_hook: Option<String>) -> Self {
-        let hook = player
+    if let Some(id) = desired
+        .output
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        let device = find_device(id).map_err(|err| anyhow!("sound card {}: {}", id, err))?;
+        config.rates = output_rates(Some(&device));
+        config.device = Some(device);
+    }
+
+    config.static_delay = settings.static_delay_ms;
+    config.initial_volume = settings.volume;
+    config.initial_muted = settings.muted;
+    config.buffer_ms = desired.buffer_ms;
+    config.required_lead_time_ms = desired.required_lead_time_ms;
+    config.format = pinned_format(desired);
+    if let Some(codecs) = offered_codecs(desired) {
+        config.codecs = codecs;
+    }
+
+    let control = desired.volume_control();
+    // A hook is a deliberate act, so it wins over a mixer we merely found.
+    let hook = match control {
+        VolumeControl::Software | VolumeControl::Alsa => None,
+        VolumeControl::Hook | VolumeControl::Auto => desired
             .volume_hook
-            .clone()
+            .as_deref()
             .or(fallback_hook)
-            .map(|command| command.trim().to_string())
-            .filter(|command| !command.is_empty());
+            .map(str::trim)
+            .filter(|command| !command.is_empty()),
+    };
+    if matches!(control, VolumeControl::Hook) && hook.is_none() {
+        warn!("volume_control is hook but no volume_hook was given; using software gain");
+    }
+    config.hooks = Hooks::new(None, None, hook).map_err(|err| anyhow!("volume hook: {}", err))?;
 
-        match player.volume_control() {
-            VolumeControl::Software => VolumeSink::Software,
-            VolumeControl::Hook => {
-                match hook {
-                    Some(command) => VolumeSink::Hook(VolumeHook::new(command)),
-                    None => {
-                        warn!("volume_control is hook but no volume_hook was given; using software gain");
-                        VolumeSink::Software
-                    }
-                }
-            }
-            VolumeControl::Alsa => match AlsaMixer::discover(player).await {
-                Some(mixer) => VolumeSink::Mixer(mixer),
-                None => {
-                    warn!("volume_control is alsa but this card has no mixer; using software gain");
-                    VolumeSink::Software
-                }
-            },
-            // A hook is a deliberate act, so it wins over a mixer we merely found.
-            VolumeControl::Auto => match hook {
-                Some(command) => VolumeSink::Hook(VolumeHook::new(command)),
-                None => match AlsaMixer::discover(player).await {
-                    Some(mixer) => VolumeSink::Mixer(mixer),
-                    None => VolumeSink::Software,
-                },
-            },
+    if desired.mixer_element.is_some() {
+        // The crate picks the element from the card's own list, and there is no way to name one.
+        // Saying so beats a setting that reads as configuration and is not.
+        warn!("mixer_element is set but the card's mixer element is chosen by the client");
+    }
+
+    #[cfg(target_os = "linux")]
+    if hook.is_none() && matches!(control, VolumeControl::Alsa | VolumeControl::Auto) {
+        config.mixer = open_mixer(desired.output.as_deref(), control, mixer_scale(desired));
+    }
+
+    Ok(Player::new(config))
+}
+
+/// The card's own volume control, where one is wanted and there is one.
+///
+/// Never fatal: a card with no gain stage is ordinary, and software volume still plays. Said out
+/// loud only when the server asked for the mixer outright, since that is the case where silence
+/// about it would be misleading.
+#[cfg(target_os = "linux")]
+fn open_mixer(
+    output: Option<&str>,
+    control: VolumeControl,
+    scale: sendspin::audio::volume_scale::VolumeScale,
+) -> Option<std::sync::Arc<sendspin::audio::mixer::Mixer>> {
+    let insisted = matches!(control, VolumeControl::Alsa);
+    let Some(card) = output.and_then(mixer_card) else {
+        if insisted {
+            warn!("volume_control is alsa but the card is not named by name; using software gain");
         }
-    }
-
-    /// Whether the software mixer is the one doing the attenuating.
-    ///
-    /// When something else is, our own gain stays at unity: attenuating twice -- once here, once in
-    /// the amplifier -- costs bits and makes the zone slider non-linear. Same lesson as the double
-    /// taper in the BeoLab chain.
-    pub fn is_software(&self) -> bool {
-        matches!(self, VolumeSink::Software)
-    }
-
-    pub async fn apply(&self, volume: u8, muted: bool) {
-        match self {
-            VolumeSink::Software => {}
-            VolumeSink::Hook(hook) => hook.apply(volume, muted).await,
-            VolumeSink::Mixer(mixer) => mixer.apply(volume, muted).await,
+        return None;
+    };
+    match sendspin::audio::mixer::Mixer::open(&card, scale) {
+        Ok(mixer) => {
+            info!("hardware volume on {} ({})", mixer.card(), mixer.element());
+            Some(std::sync::Arc::new(mixer))
+        }
+        Err(err) if insisted => {
+            warn!("volume_control is alsa but {}; using software gain", err);
+            None
+        }
+        Err(err) => {
+            info!("no hardware volume on {}: {}", card, err);
+            None
         }
     }
 }
 
-/// Run one connection until it closes, then return so the caller can back off and retry.
+/// How to map a percentage onto this card, when the server has an opinion.
 ///
-/// `Ok(())` means the server hung up (or we were told to stop); `Err` means we never got going --
-/// the card is missing, the socket refused. Both end the session, but only one is worth reporting as
-/// a fault.
-pub async fn run_session(
-    params: &PlayerParams,
-    settings_rx: &mut watch::Receiver<LiveSettings>,
-    status: &PlayerHandle,
-    volume: &VolumeSink,
-) -> Result<()> {
-    let device = match params.output.as_deref() {
-        Some(id) if !id.trim().is_empty() => Some(
-            devices::find_output_device(id)
-                // Deliberately not "fall back to the default card": if the server was told to use
-                // the DAC and the DAC is unplugged, playing out of HDMI instead is a worse answer
-                // than saying the card is gone.
-                .ok_or_else(|| anyhow!("output device '{}' not found", id))?,
-        ),
-        _ => None,
-    };
+/// Absent means the crate asks the card, which is right wherever a card describes itself honestly.
+/// `mixer_mapped` is for the one that does not, and it is a per-installation fact: somebody measured
+/// this speaker.
+#[cfg(target_os = "linux")]
+fn mixer_scale(desired: &DesiredPlayer) -> sendspin::audio::volume_scale::VolumeScale {
+    use sendspin::audio::volume_scale::VolumeScale;
+    match desired.mixer_mapped {
+        Some(true) => VolumeScale::Decibel,
+        Some(false) => VolumeScale::Raw,
+        None => VolumeScale::Automatic,
+    }
+}
 
-    let mut settings = settings_rx.borrow_and_update().clone();
-    status.set_state(STATE_CONNECTING);
+/// `alsa:hw:CARD=CDCACM,DEV=0` -> `hw:CARD=CDCACM`, which is what a mixer is addressed by.
+///
+/// Only the by-name spelling is accepted. A number names whichever card enumerated first this boot,
+/// and setting the volume of the wrong card is worse than not setting it.
+#[cfg(target_os = "linux")]
+fn mixer_card(device_id: &str) -> Option<String> {
+    let card = device_id.split_once("CARD=")?.1;
+    let card = card.split(',').next().unwrap_or(card).trim();
+    if card.is_empty() || card.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("hw:CARD={}", card))
+}
 
-    let client = ProtocolClientBuilder::builder()
-        .client_id(params.client_id.clone())
-        .name(params.name.clone())
-        .player_v1_support(PlayerV1Support {
-            supported_formats: advertised_formats(params),
-            buffer_capacity: BUFFER_CAPACITY_BYTES.try_into().unwrap_or_default(),
-            // Volume and mute are accepted so the server can drive this player from a zone slider;
-            // whether that lands on software gain or a hardware hook is decided below.
-            supported_commands: vec![
-                "volume".to_string(),
-                "mute".to_string(),
-                "set_static_delay".to_string(),
-            ],
-        })
-        .initial_player_state(PlayerState {
-            volume: Some(settings.volume),
-            muted: Some(settings.muted),
-            static_delay_ms: Some(settings.static_delay_ms),
-            required_lead_time_ms: Some(params.required_lead_time_ms.unwrap_or(DEFAULT_LEAD_MS)),
-            min_buffer_ms: Some(params.buffer_ms.unwrap_or(DEFAULT_BUFFER_MS)),
-            supported_commands: Some(vec![PlayerStateCommand::SetStaticDelay]),
-        })
-        .build()
-        .connect(&params.url)
-        .await
-        .with_context(|| format!("connect to {}", params.url))?;
+/// A format the server pinned, or nothing at all.
+///
+/// Pinning is for hardware that genuinely accepts one format; without both a rate and a depth there
+/// is nothing to pin, and the client offers everything its card can open instead.
+fn pinned_format(desired: &DesiredPlayer) -> Option<AudioFormatSpec> {
+    let sample_rate = desired.sample_rate?;
+    let bit_depth = desired.bit_depth?;
+    Some(AudioFormatSpec {
+        codec: desired
+            .codecs
+            .as_ref()
+            .and_then(|codecs| codecs.first())
+            .cloned()
+            .unwrap_or_else(|| "pcm".to_string()),
+        channels: desired
+            .channels
+            .and_then(|channels| u8::try_from(channels).ok())
+            .unwrap_or(DEFAULT_CHANNELS),
+        sample_rate,
+        bit_depth,
+    })
+}
 
-    info!(
-        client_id = %params.client_id,
-        url = %params.url,
-        output = params.output.as_deref().unwrap_or("(default)"),
-        "sendspin player connected"
-    );
-    status.set_state_ok(STATE_CONNECTED);
+/// The codecs the server allowed, in the crate's own preference order.
+///
+/// `None` leaves the crate's offer alone. A name this build cannot decode is dropped rather than
+/// passed on: an offer has to be something the client can actually play, or it promises a server
+/// audio that will arrive and go nowhere.
+fn offered_codecs(desired: &DesiredPlayer) -> Option<Vec<CodecOffer>> {
+    let wanted = desired.codecs.as_ref()?;
+    if wanted.is_empty() {
+        return None;
+    }
+    let allowed: Vec<String> = wanted
+        .iter()
+        .map(|codec| codec.trim().to_ascii_lowercase())
+        .collect();
+    let offer: Vec<CodecOffer> = CodecOffer::all()
+        .into_iter()
+        .filter(|offer| allowed.contains(&offer.codec))
+        .collect();
+    if offer.is_empty() {
+        warn!(
+            "none of the codecs the server named can be decoded here ({}); offering all of them",
+            wanted.join(", ")
+        );
+        return None;
+    }
+    Some(offer)
+}
 
-    let connection = client.split();
-    let mut message_rx = connection.messages;
-    let mut audio_rx = connection.audio;
-    let clock_sync = connection.clock_sync;
-    let sender = connection.sender;
-    let _guard = connection.guard;
+/// Run one player until it is told to stop, reporting what it does as it does it.
+pub async fn run(
+    player: Player,
+    url: String,
+    status: PlayerHandle,
+    mut settings_rx: watch::Receiver<LiveSettings>,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    let mut player_status = player.status();
+    report(&player_status.borrow(), &status);
 
-    let software_volume = volume.is_software();
-    volume.apply(settings.volume, settings.muted).await;
-
-    let mut player: Option<SyncedPlayer> = None;
-    let mut format: Option<AudioFormat> = None;
-    let mut decoder: Option<Box<dyn Decoder>> = None;
-    let mut pcm_endian_locked = false;
-
-    // A closure rather than a helper function: the clock handle's type is the crate's own, and
-    // capturing it here means never having to name it.
-    let open_output = |format: &AudioFormat, volume: u8, muted: bool| -> Result<SyncedPlayer> {
-        SyncedPlayer::new(
-            format.clone(),
-            Arc::clone(&clock_sync),
-            SyncedPlayerConfig {
-                device: device.clone(),
-                volume: if software_volume { volume } else { 100 },
-                muted: software_volume && muted,
-                buffer_size: None,
-            },
-        )
-        .map_err(|err| anyhow!("open audio output: {}", err))
-    };
-
-    // Clock sync is the library's own business: it sends `client/time` and consumes `server/time`
-    // without ever forwarding it here, so the only way to report on the lock is to look at the
-    // filter. Once a second is plenty for a number that moves in milliseconds.
-    let mut clock_report = tokio::time::interval(CLOCK_REPORT_INTERVAL);
+    // The crate reconnects on its own, waiting longer each time up to a minute, so this returns only
+    // when the player gives up for good.
+    let session = player.run_outbound(&url, Some(RECONNECT_DELAY));
+    tokio::pin!(session);
 
     loop {
         tokio::select! {
-            _ = clock_report.tick() => {
-                let sync = clock_sync.lock();
-                let rtt_ms = sync.rtt_micros().map(|rtt| rtt as f64 / 1000.0);
-                let quality = format!("{:?}", sync.quality()).to_lowercase();
-                drop(sync);
-                status.set_clock(rtt_ms, Some(quality));
-            }
-            // Live settings before audio: a volume command should not wait behind a queue of chunks.
-            changed = settings_rx.changed() => {
-                if changed.is_err() {
-                    // The supervisor dropped us; it is already tearing this task down.
-                    return Ok(());
+            outcome = &mut session => {
+                if let Err(err) = outcome {
+                    warn!("player session ended: {}", err);
+                    status.set_error(err.to_string());
                 }
+                return;
+            }
+            Ok(()) = player_status.changed() => {
+                report(&player_status.borrow(), &status);
+            }
+            Ok(()) = settings_rx.changed() => {
                 let next = settings_rx.borrow_and_update().clone();
-                if next == settings {
-                    continue;
-                }
-                settings = next;
-                apply_settings(&settings, player.as_ref(), volume, software_volume, status, &sender).await;
+                player.set_static_delay(next.static_delay_ms);
+                // The level too: this arm carries both the server's seed and a press on the
+                // remote, and the crate reports the result back over `client/state` either way.
+                player.set_volume(next.volume, next.muted);
+                status.set_static_delay(next.static_delay_ms);
             }
-            message = message_rx.recv() => {
-                // `None` is the socket closing: end the session so the supervisor can reconnect.
-                // Treating a closed channel as "nothing happened" turns this select into a spin.
-                let Some(message) = message else { break };
-                match message {
-                    Message::StreamStart(stream_start) => {
-                        let Some(config) = stream_start.player.as_ref() else {
-                            debug!("stream/start carried no player config");
-                            continue;
-                        };
-                        let codec = match parse_codec(&config.codec) {
-                            Some(codec) => codec,
-                            None => {
-                                // Nothing to do but say so: the server picked something outside what
-                                // we advertised, and guessing a decoder would render noise.
-                                status.set_error(format!("unsupported codec '{}'", config.codec));
-                                decoder = None;
-                                format = None;
-                                continue;
-                            }
-                        };
-                        let header = match config.codec_header.as_deref().map(decode_header) {
-                            Some(Ok(header)) => Some(header),
-                            Some(Err(err)) => {
-                                status.set_error(format!("invalid codec header: {}", err));
-                                continue;
-                            }
-                            None => None,
-                        };
-                        let next_format = AudioFormat {
-                            codec,
-                            sample_rate: config.sample_rate,
-                            channels: config.channels,
-                            bit_depth: config.bit_depth,
-                            codec_header: header.clone(),
-                        };
-
-                        // A rate or depth change means a different cpal stream, so the open output
-                        // is released here and reopened on the first chunk of the new format. The
-                        // upstream example keeps its first player forever, which is fine for a demo
-                        // and wrong for a server that switches between 44.1 and 48 per track.
-                        if output_needs_reopen(format.as_ref(), &next_format) {
-                            if let Some(open) = player.take() {
-                                open.clear();
-                            }
-                        }
-
-                        info!(
-                            client_id = %params.client_id,
-                            codec = %config.codec,
-                            sample_rate = config.sample_rate,
-                            bit_depth = config.bit_depth,
-                            channels = config.channels,
-                            "stream starting"
-                        );
-                        decoder = build_decoder(&next_format, header.as_deref());
-                        // Only raw PCM has an endianness to settle, and it is settled on its first
-                        // chunk; a framed codec is "locked" from the start.
-                        pcm_endian_locked = codec != Codec::Pcm;
-                        format = Some(next_format);
-                        status.set_format(
-                            &config.codec,
-                            config.sample_rate,
-                            config.bit_depth,
-                            u16::from(config.channels),
-                        );
-                        status.set_state_ok(STATE_STREAMING);
-                    }
-                    Message::StreamEnd(_) | Message::StreamClear(_) => {
-                        if let Some(open) = player.as_ref() {
-                            open.clear();
-                        }
-                        decoder = None;
-                        format = None;
-                        pcm_endian_locked = false;
-                        status.clear_format();
-                        status.set_state_ok(STATE_CONNECTED);
-                    }
-                    Message::ServerCommand(command) => {
-                        if let Some(player_command) = command.player {
-                            settings = apply_command(settings.clone(), &player_command);
-                            apply_settings(
-                                &settings,
-                                player.as_ref(),
-                                volume,
-                                software_volume,
-                                status,
-                                &sender,
-                            )
-                            .await;
-                        }
-                    }
-                    other => debug!("unhandled sendspin message: {:?}", other),
-                }
-            }
-            chunk = audio_rx.recv() => {
-                let Some(chunk) = chunk else { break };
-                let Some(active_format) = format.as_ref() else {
-                    // Chunks before (or after) a stream/start have no format to decode against.
-                    continue;
-                };
-
-                if active_format.codec == Codec::Pcm {
-                    let bytes_per_sample = usize::from(active_format.bit_depth) / 8;
-                    let frame = bytes_per_sample * usize::from(active_format.channels);
-                    // Raw PCM has no framing of its own, so a partial frame is the first sign the
-                    // stream and our idea of its format disagree. Decoding it would emit a click.
-                    if frame == 0 || chunk.data.len() % frame != 0 {
-                        warn!(
-                            "dropping {} PCM bytes that do not fill {}-byte frames",
-                            chunk.data.len(),
-                            frame
-                        );
-                        continue;
-                    }
-                    if !pcm_endian_locked {
-                        // Little-endian: what every host platform and our own server produce. The
-                        // protocol has no field for it, so this is a convention, not a negotiation.
-                        decoder = Some(Box::new(PcmDecoder::with_endian(
-                            active_format.bit_depth,
-                            PcmEndian::Little,
-                        )));
-                        pcm_endian_locked = true;
-                    }
-                }
-
-                let Some(active_decoder) = decoder.as_ref() else {
-                    continue;
-                };
-                let samples = match active_decoder.decode(&chunk.data) {
-                    Ok(samples) => samples,
-                    Err(err) => {
-                        // One bad frame is not a dead stream; the next one usually decodes.
-                        debug!("decode error: {}", err);
-                        continue;
-                    }
-                };
-
-                if player.is_none() {
-                    match open_output(active_format, settings.volume, settings.muted) {
-                        Ok(open) => {
-                            open.set_static_delay(settings.static_delay_ms);
-                            player = Some(open);
-                        }
-                        Err(err) => {
-                            // The card is there but will not open at this format. Reporting and
-                            // returning lets the supervisor retry with backoff instead of spinning
-                            // on every chunk.
-                            status.set_error(err.to_string());
-                            return Err(err);
-                        }
-                    }
-                }
-
-                if let Some(open) = player.as_ref() {
-                    open.enqueue(AudioBuffer {
-                        timestamp: chunk.timestamp,
-                        samples,
-                        format: active_format.clone(),
-                    });
-                    if let Some(err) = open.take_error() {
-                        // A cpal callback error (device removed, xrun storm) is fatal to this stream.
-                        status.set_error(err.clone());
-                        return Err(anyhow!("audio output failed: {}", err));
-                    }
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow() {
+                    // Dropping the session future closes the card, which is the point of being
+                    // asked to stop.
+                    return;
                 }
             }
         }
     }
-
-    info!(client_id = %params.client_id, "sendspin session ended");
-    status.set_state(STATE_IDLE);
-    status.clear_format();
-    Ok(())
 }
 
-/// Fold a server player command into the live settings.
-fn apply_command(mut settings: LiveSettings, command: &PlayerCommand) -> LiveSettings {
-    match command.command {
-        PlayerCommandType::Volume => {
-            if let Some(volume) = command.volume {
-                settings.volume = volume.min(100);
-            }
-        }
-        PlayerCommandType::Mute => {
-            if let Some(muted) = command.mute {
-                settings.muted = muted;
-            }
-        }
-        PlayerCommandType::SetStaticDelay => {
-            if let Some(delay_ms) = command.static_delay_ms {
-                settings.static_delay_ms = delay_ms;
-            }
-        }
-        _ => {}
+/// Copy what the player says about itself into what this device reports upstream.
+fn report(from: &PlayerStatus, to: &PlayerHandle) {
+    match &from.last_error {
+        Some(error) => to.set_error(error.clone()),
+        None => to.set_state_ok(state_name(from.connection)),
     }
-    settings
-}
-
-async fn apply_settings(
-    settings: &LiveSettings,
-    player: Option<&SyncedPlayer>,
-    volume: &VolumeSink,
-    software_volume: bool,
-    status: &PlayerHandle,
-    sender: &WsSender,
-) {
-    if let Some(open) = player {
-        open.set_static_delay(settings.static_delay_ms);
-        if software_volume {
-            open.set_volume(settings.volume);
-            open.set_mute(settings.muted);
-        }
-    }
-    volume.apply(settings.volume, settings.muted).await;
-    status.set_volume(settings.volume, settings.muted);
-    status.set_static_delay(settings.static_delay_ms);
-    report_state(sender, settings).await;
-}
-
-/// Tell the server where this player ended up.
-///
-/// It matters most when the change did *not* come from the server: a B&O remote turning the volume up
-/// is invisible otherwise, and the zone slider would sit at the old level until something else moved
-/// it. Echoing a change the server itself asked for is harmless -- the reference client does the same.
-async fn report_state(sender: &WsSender, settings: &LiveSettings) {
-    let state = ClientState {
-        // A volume report says nothing about whether this player is available, and claiming
-        // either way on every volume change would be the client talking over itself.
-        available: None,
-        state: None,
-        player: Some(PlayerState {
-            volume: Some(settings.volume),
-            muted: Some(settings.muted),
-            static_delay_ms: Some(settings.static_delay_ms),
-            required_lead_time_ms: None,
-            min_buffer_ms: None,
-            supported_commands: None,
-        }),
-        source: None,
-    };
-    if let Err(err) = sender.send_message(Message::ClientState(state)).await {
-        // Not fatal: the socket is about to be torn down anyway, and the next connection re-announces
-        // everything in its initial state.
-        debug!("could not report player state: {}", err);
+    to.set_volume(from.volume, from.muted);
+    match &from.format {
+        Some(format) => to.set_format(
+            codec_name(format.codec),
+            format.sample_rate,
+            format.bit_depth,
+            u16::from(format.channels),
+        ),
+        None => to.clear_format(),
     }
 }
 
-/// Whether the open cpal stream can carry the next format or has to be reopened.
-fn output_needs_reopen(current: Option<&AudioFormat>, next: &AudioFormat) -> bool {
-    match current {
-        None => false,
-        Some(current) => {
-            current.sample_rate != next.sample_rate
-                || current.channels != next.channels
-                || current.bit_depth != next.bit_depth
-        }
+fn state_name(state: ConnectionState) -> &'static str {
+    match state {
+        ConnectionState::Disconnected => STATE_IDLE,
+        ConnectionState::Connecting => STATE_CONNECTING,
+        ConnectionState::Connected => STATE_CONNECTED,
+        ConnectionState::Playing => STATE_STREAMING,
     }
 }
 
-/// Build the decoder for a stream. Takes the whole format so codec, rate and channel count come
-/// from one place -- an Opus decoder built at the wrong rate decodes to garbage.
-fn build_decoder(format: &AudioFormat, header: Option<&[u8]>) -> Option<Box<dyn Decoder>> {
-    match format.codec {
-        // Built on the first chunk instead, once the endianness is settled.
-        Codec::Pcm => None,
-        Codec::Flac => Some(match header {
-            // Without STREAMINFO the decoder has to infer the stream; our server always sends the
-            // header, so a rejected one is worth a line in the log before falling back.
-            Some(header) => match FlacDecoder::with_header(header) {
-                Ok(decoder) => Box::new(decoder),
-                Err(err) => {
-                    warn!("FLAC header rejected, decoding without it: {}", err);
-                    Box::new(FlacDecoder::new())
-                }
-            },
-            None => Box::new(FlacDecoder::new()),
-        }),
-        Codec::Opus => match OpusDecoder::new(format.sample_rate, format.channels) {
-            Ok(decoder) => Some(Box::new(decoder)),
-            Err(err) => {
-                warn!("Opus decoder unavailable: {}", err);
-                None
-            }
-        },
-        _ => None,
-    }
-}
-
-fn parse_codec(codec: &str) -> Option<Codec> {
+fn codec_name(codec: Codec) -> &'static str {
     match codec {
-        "pcm" => Some(Codec::Pcm),
-        "flac" => Some(Codec::Flac),
-        "opus" => Some(Codec::Opus),
-        _ => None,
+        Codec::Pcm => "pcm",
+        Codec::Opus => "opus",
+        Codec::Flac => "flac",
+        Codec::Mp3 => "mp3",
     }
-}
-
-fn decode_header(encoded: &str) -> Result<Vec<u8>> {
-    BASE64_STANDARD
-        .decode(encoded)
-        .context("base64 codec header")
-}
-
-/// The format list in `client/hello`, best first.
-///
-/// The server picks from this and prefers the source's own rate when it appears here, so a pinned
-/// rate is a real constraint -- worth doing for a DAC that only does 48 kHz, worth avoiding
-/// otherwise.
-fn advertised_formats(params: &PlayerParams) -> Vec<AudioFormatSpec> {
-    let codecs = if params.codecs.is_empty() {
-        SUPPORTED_CODECS.iter().map(|c| c.to_string()).collect()
-    } else {
-        params.codecs.clone()
-    };
-    let rates: Vec<u32> = match params.sample_rate {
-        Some(rate) => vec![rate],
-        None => DEFAULT_RATES.to_vec(),
-    };
-    let depths: Vec<u8> = match params.bit_depth {
-        Some(depth) => vec![depth],
-        None => DEFAULT_BIT_DEPTHS.to_vec(),
-    };
-    let channels = params.channels.unwrap_or(DEFAULT_CHANNELS);
-
-    let mut formats = Vec::new();
-    for codec in codecs {
-        // Opus is defined at 16 bit; offering 24 would advertise something we cannot receive.
-        let codec_depths: Vec<u8> = if codec == "opus" {
-            vec![16]
-        } else {
-            depths.clone()
-        };
-        for rate in &rates {
-            for depth in &codec_depths {
-                formats.push(AudioFormatSpec {
-                    codec: codec.clone(),
-                    channels: channels.try_into().unwrap_or_default(),
-                    sample_rate: *rate,
-                    bit_depth: *depth,
-                });
-            }
-        }
-    }
-    formats
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn params() -> PlayerParams {
-        PlayerParams {
-            url: "ws://127.0.0.1:7090/sendspin".to_string(),
-            client_id: "sonn-test".to_string(),
-            name: "Test".to_string(),
-            output: None,
-            codecs: Vec::new(),
-            sample_rate: None,
-            bit_depth: None,
-            channels: None,
-            buffer_ms: None,
-            required_lead_time_ms: None,
+    fn with_codecs(codecs: Option<Vec<&str>>) -> DesiredPlayer {
+        DesiredPlayer {
+            codecs: codecs.map(|codecs| codecs.into_iter().map(str::to_string).collect()),
+            ..DesiredPlayer::named("speaker")
         }
     }
 
     #[test]
-    fn both_rates_are_offered_when_none_is_pinned() {
-        let formats = advertised_formats(&params());
-        assert!(formats.iter().any(|f| f.sample_rate == 44_100));
-        assert!(formats.iter().any(|f| f.sample_rate == 48_000));
+    fn the_offer_is_narrowed_to_what_the_server_allowed() {
+        let offer = offered_codecs(&with_codecs(Some(vec!["flac", "pcm"]))).expect("an offer");
+        assert!(offer.iter().all(|entry| entry.codec != "opus"));
+        assert!(offer.iter().any(|entry| entry.codec == "flac"));
+
+        // Absent means "whatever you can decode", which is the crate's own offer.
+        assert!(offered_codecs(&with_codecs(None)).is_none());
+        assert!(offered_codecs(&with_codecs(Some(vec![]))).is_none());
+
+        // A codec this build cannot decode would promise a server audio that arrives and goes
+        // nowhere, so the whole offer falls back rather than narrowing to nothing.
+        assert!(offered_codecs(&with_codecs(Some(vec!["ape"]))).is_none());
     }
 
     #[test]
-    fn a_pinned_format_is_the_only_one_offered() {
-        let mut params = params();
-        params.codecs = vec!["pcm".to_string()];
-        params.sample_rate = Some(48_000);
-        params.bit_depth = Some(16);
-        let formats = advertised_formats(&params);
-        assert_eq!(formats.len(), 1);
-        assert_eq!(formats[0].codec, "pcm");
-        assert_eq!(formats[0].sample_rate, 48_000);
-        assert_eq!(formats[0].bit_depth, 16);
+    fn a_format_is_only_pinned_when_there_is_one_to_pin() {
+        assert!(pinned_format(&with_codecs(None)).is_none());
+
+        let pinned = pinned_format(&DesiredPlayer {
+            sample_rate: Some(44_100),
+            bit_depth: Some(24),
+            ..DesiredPlayer::named("speaker")
+        })
+        .expect("a pinned format");
+        assert_eq!(pinned.sample_rate, 44_100);
+        assert_eq!(pinned.bit_depth, 24);
+        assert_eq!(pinned.channels, DEFAULT_CHANNELS);
+        assert_eq!(pinned.codec, "pcm");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn opus_is_never_offered_at_24_bit() {
-        let mut params = params();
-        params.codecs = vec!["opus".to_string()];
-        params.bit_depth = Some(24);
-        let formats = advertised_formats(&params);
-        assert!(formats.iter().all(|f| f.bit_depth == 16));
-    }
-
-    #[test]
-    fn a_rate_change_reopens_the_output_but_a_codec_change_alone_does_not() {
-        let base = AudioFormat {
-            codec: Codec::Flac,
-            sample_rate: 44_100,
-            channels: 2,
-            bit_depth: 16,
-            codec_header: None,
-        };
-        let same_rate_other_codec = AudioFormat {
-            codec: Codec::Pcm,
-            ..base.clone()
-        };
-        let other_rate = AudioFormat {
-            sample_rate: 48_000,
-            ..base.clone()
-        };
-        assert!(!output_needs_reopen(Some(&base), &same_rate_other_codec));
-        assert!(output_needs_reopen(Some(&base), &other_rate));
-        assert!(!output_needs_reopen(None, &base));
-    }
-
-    #[test]
-    fn volume_and_mute_commands_fold_into_live_settings() {
-        let settings = LiveSettings {
-            volume: 40,
-            muted: false,
-            static_delay_ms: 0,
-        };
-        let louder = apply_command(
-            settings.clone(),
-            &PlayerCommand {
-                command: PlayerCommandType::Volume,
-                volume: Some(70),
-                mute: None,
-                static_delay_ms: None,
-            },
+    fn a_mixer_is_addressed_by_card_name_only() {
+        assert_eq!(
+            mixer_card("alsa:hw:CARD=CDCACM,DEV=0").as_deref(),
+            Some("hw:CARD=CDCACM")
         );
-        assert_eq!(louder.volume, 70);
-        let muted = apply_command(
-            settings,
-            &PlayerCommand {
-                command: PlayerCommandType::Mute,
-                volume: None,
-                mute: Some(true),
-                static_delay_ms: None,
-            },
-        );
-        assert!(muted.muted);
-        assert_eq!(muted.volume, 40, "muting must not forget the level");
+        // The number moves with USB probe order, and setting the wrong card's volume is worse than
+        // leaving it in software.
+        assert_eq!(mixer_card("alsa:hw:CARD=3,DEV=0"), None);
+        assert_eq!(mixer_card("alsa:null"), None);
     }
 }

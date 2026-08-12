@@ -13,19 +13,16 @@
 
 use crate::beoremote::{self, BeoremoteConfig};
 use crate::components;
-use crate::hooks::ControlHook;
 use crate::models::{DesiredConfig, DesiredPlayer, DesiredSource};
-use crate::player::{self, LiveSettings, PlayerParams};
-use crate::source::{self, SignalSettings, SourceParams};
+use crate::player::{self, LiveSettings};
+use crate::source::{self, SignalSettings};
 use crate::status::Registry;
 use std::collections::HashMap;
 use std::future::Future;
 use std::thread::JoinHandle;
-use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, info, warn};
 
-const DEFAULT_VOLUME: u8 = 100;
 /// Depth of the volume queue. A burst of remote presses is six or so; anything past this is a device
 /// that is not keeping up, and dropping the surplus beats queueing a slider that has moved on.
 const VOLUME_QUEUE: usize = 32;
@@ -182,11 +179,7 @@ async fn reconcile_players(
     }
 
     for player in wanted {
-        let settings = LiveSettings {
-            volume: player.volume.unwrap_or(DEFAULT_VOLUME).min(100),
-            muted: player.muted.unwrap_or(false),
-            static_delay_ms: player.static_delay_ms.unwrap_or(0),
-        };
+        let settings = LiveSettings::from_desired(player);
 
         if let Some(entry) = running.get_mut(&player.client_id) {
             if entry.last_desired != settings {
@@ -197,25 +190,11 @@ async fn reconcile_players(
             continue;
         }
 
-        let params = PlayerParams {
-            url: url.to_string(),
-            client_id: player.client_id.clone(),
-            name: player
-                .name
-                .clone()
-                .or_else(|| desired.device_name.clone())
-                .unwrap_or_else(|| player.client_id.clone()),
-            output: player.output.clone(),
-            codecs: player.codecs.clone().unwrap_or_default(),
-            sample_rate: player.sample_rate,
-            bit_depth: player.bit_depth,
-            channels: player.channels,
-            buffer_ms: player.buffer_ms,
-            required_lead_time_ms: player.required_lead_time_ms,
-        };
-        // Resolved here rather than in the session loop: it reads the card, and a reconnect should
-        // not re-interrogate the mixer every few seconds.
-        let volume = player::VolumeSink::resolve(player, ctx.fallback_volume_hook.clone()).await;
+        let name = player
+            .name
+            .clone()
+            .or_else(|| desired.device_name.clone())
+            .unwrap_or_else(|| player.client_id.clone());
         let status = ctx.statuses.handle(
             &player.client_id,
             player.output.clone(),
@@ -223,56 +202,40 @@ async fn reconcile_players(
             settings.muted,
             settings.static_delay_ms,
         );
+        // Built here rather than on the audio thread: opening the card and reading its mixer is
+        // where this fails, and a failure has to reach the server as a fault on this speaker
+        // instead of disappearing into a thread that quietly retries.
+        let built = player::build(
+            player,
+            name.clone(),
+            ctx.fallback_volume_hook.as_deref(),
+            &settings,
+        );
+        let session = match built {
+            Ok(session) => session,
+            Err(err) => {
+                warn!(client_id = %player.client_id, "cannot start player: {:#}", err);
+                status.set_error(format!("{:#}", err));
+                continue;
+            }
+        };
+
         let (settings_tx, settings_rx) = watch::channel(settings.clone());
         let (stop_tx, stop_rx) = watch::channel(false);
 
         info!(
-            client_id = %params.client_id,
-            name = %params.name,
-            output = params.output.as_deref().unwrap_or("(default)"),
+            client_id = %player.client_id,
+            name = %name,
+            output = player.output.as_deref().unwrap_or("(default)"),
             "starting player"
         );
         let key = player.restart_key(url);
         let thread_name = format!("player-{}", short_name(&player.client_id));
-        let thread = spawn_audio_thread(thread_name, move || {
-            let mut settings_rx = settings_rx;
-            let mut stop_rx = stop_rx;
-            async move {
-                let mut backoff = Backoff::new();
-                loop {
-                    let outcome = tokio::select! {
-                        result = player::run_session(
-                            &params,
-                            &mut settings_rx,
-                            &status,
-                            &volume,
-                        ) => result,
-                        _ = stop_rx.changed() => {
-                            // Dropping the session future closes the card, which is the point of
-                            // being asked to stop.
-                            if *stop_rx.borrow() {
-                                return;
-                            }
-                            continue;
-                        }
-                    };
-                    match outcome {
-                        Ok(()) => backoff.reset(),
-                        Err(err) => {
-                            warn!(client_id = %params.client_id, "player session failed: {:#}", err);
-                            status.set_error(format!("{:#}", err));
-                        }
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff.next_delay()) => {}
-                        _ = stop_rx.changed() => {
-                            if *stop_rx.borrow() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
+        let url = url.to_string();
+        // Its own OS thread with a current-thread runtime: cpal's stream is not guaranteed to be
+        // Send, so the session that owns it cannot be moved between worker threads.
+        let thread = spawn_audio_thread(thread_name, move || async move {
+            player::run(session, url, status, settings_rx, stop_rx).await;
         });
 
         running.insert(
@@ -402,14 +365,7 @@ async fn reconcile_sources(
     }
 
     for desired_source in wanted {
-        let signal = SignalSettings {
-            threshold_db: desired_source
-                .threshold_db
-                .unwrap_or(SignalSettings::default().threshold_db),
-            hold_ms: desired_source
-                .hold_ms
-                .unwrap_or(SignalSettings::default().hold_ms),
-        };
+        let signal = SignalSettings::from_desired(desired_source);
 
         if let Some(entry) = running.get_mut(&desired_source.client_id) {
             if entry.last_desired != signal {
@@ -419,82 +375,46 @@ async fn reconcile_sources(
             continue;
         }
 
-        let params = SourceParams {
-            url: url.to_string(),
-            client_id: desired_source.client_id.clone(),
-            name: desired_source
-                .name
-                .clone()
-                .unwrap_or_else(|| desired_source.client_id.clone()),
-            input: desired_source.input.clone(),
-            sample_rate: desired_source
-                .sample_rate
-                .unwrap_or(source::DEFAULT_SAMPLE_RATE),
-            channels: desired_source.channels.unwrap_or(source::DEFAULT_CHANNELS),
-            bit_depth: desired_source
-                .bit_depth
-                .unwrap_or(source::DEFAULT_BIT_DEPTH),
-            frame_ms: desired_source.frame_ms.unwrap_or(source::DEFAULT_FRAME_MS),
-            controls: desired_source
-                .controls
-                .clone()
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|value| source::parse_control(value))
-                .collect(),
-            always_on: desired_source.always_on.unwrap_or(false),
-        };
-        let control_hook = desired_source.control_hook.clone().map(ControlHook::new);
+        let name = desired_source
+            .name
+            .clone()
+            .unwrap_or_else(|| desired_source.client_id.clone());
         let status = ctx
             .statuses
             .source_handle(&desired_source.client_id, desired_source.input.clone());
+        // Transport controls used to ride on the source role. The protocol has no such message --
+        // that surface was this client's invention -- so a configured hook would now be a setting
+        // that silently does nothing, which is worse than one that is missing.
+        if desired_source.control_hook.is_some() || desired_source.controls.is_some() {
+            warn!(
+                client_id = %desired_source.client_id,
+                "transport controls are configured for this input, but the source role carries no \
+                 command for them; they are not being used"
+            );
+        }
+        let built = source::build(desired_source, name);
+        let session = match built {
+            Ok(session) => session,
+            Err(err) => {
+                warn!(client_id = %desired_source.client_id, "cannot start source: {:#}", err);
+                status.set_error(format!("{:#}", err));
+                continue;
+            }
+        };
+
         let (signal_tx, signal_rx) = watch::channel(signal);
         let (stop_tx, stop_rx) = watch::channel(false);
 
         info!(
-            client_id = %params.client_id,
-            input = params.input.as_deref().unwrap_or("(default)"),
+            client_id = %desired_source.client_id,
+            input = desired_source.input.as_deref().unwrap_or("(default)"),
             "starting source"
         );
         let key = desired_source.restart_key(url);
         let thread_name = format!("source-{}", short_name(&desired_source.client_id));
-        let thread = spawn_audio_thread(thread_name, move || {
-            let mut signal_rx = signal_rx;
-            let mut stop_rx = stop_rx;
-            async move {
-                let mut backoff = Backoff::new();
-                loop {
-                    let outcome = tokio::select! {
-                        result = source::run_session(
-                            &params,
-                            &mut signal_rx,
-                            &status,
-                            control_hook.as_ref(),
-                        ) => result,
-                        _ = stop_rx.changed() => {
-                            if *stop_rx.borrow() {
-                                return;
-                            }
-                            continue;
-                        }
-                    };
-                    match outcome {
-                        Ok(()) => backoff.reset(),
-                        Err(err) => {
-                            warn!(client_id = %params.client_id, "source session failed: {:#}", err);
-                            status.set_error(format!("{:#}", err));
-                        }
-                    }
-                    tokio::select! {
-                        _ = tokio::time::sleep(backoff.next_delay()) => {}
-                        _ = stop_rx.changed() => {
-                            if *stop_rx.borrow() {
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
+        let url = url.to_string();
+        let thread = spawn_audio_thread(thread_name, move || async move {
+            source::run(session, url, status, signal_rx, stop_rx).await;
         });
 
         running.insert(
@@ -656,46 +576,9 @@ fn short_name(client_id: &str) -> String {
     client_id.chars().rev().take(6).collect()
 }
 
-/// 1s doubling to 30s. A server restart should be picked up in a second; a card that will never open
-/// should not be retried in a hot loop.
-struct Backoff {
-    current: Duration,
-}
-
-impl Backoff {
-    fn new() -> Self {
-        Self {
-            current: Duration::from_secs(1),
-        }
-    }
-
-    fn reset(&mut self) {
-        self.current = Duration::from_secs(1);
-    }
-
-    fn next_delay(&mut self) -> Duration {
-        let delay = self.current;
-        self.current = (self.current * 2).min(Duration::from_secs(30));
-        delay
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn backoff_grows_and_settles_at_thirty_seconds() {
-        let mut backoff = Backoff::new();
-        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
-        assert_eq!(backoff.next_delay(), Duration::from_secs(2));
-        for _ in 0..10 {
-            backoff.next_delay();
-        }
-        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
-        backoff.reset();
-        assert_eq!(backoff.next_delay(), Duration::from_secs(1));
-    }
 
     #[test]
     fn a_missing_endpoint_reads_as_no_endpoint() {
