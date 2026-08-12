@@ -24,6 +24,7 @@
 //! player and reported upstream.
 
 mod api;
+mod gatt;
 mod protocol;
 
 use crate::models::BeoremoteStatusReport;
@@ -35,8 +36,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::AsyncReadExt;
+use tokio::net::UnixListener;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -44,8 +45,6 @@ pub const DEFAULT_PLUGIN_SOCKET: &str = "/var/run/beoremote_one_socket";
 pub const DEFAULT_HOG_SOCKET: &str = "/tmp/streamsdk_hog";
 const DEFAULT_MENU_POLL_MS: u64 = 10_000;
 const DEFAULT_VOLUME_STEP: u8 = 4;
-/// The plugin needs a moment between attribute writes; B&O's own daemon paces them the same way.
-const ATTRIBUTE_PACE: Duration = Duration::from_millis(150);
 /// How long to wait before re-dialling the plugin socket. Absent usually means bluetoothd is not
 /// running, which is a normal state on a device whose B&O component was never installed.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
@@ -175,8 +174,8 @@ pub async fn run(
             last_error: None,
         }));
 
-        match serve_plugin(&config, &statuses, &volume_tx, &hid_connected).await {
-            Ok(()) => info!("beoremote plugin socket closed"),
+        match serve_remote(&config, &statuses, &volume_tx, &hid_connected).await {
+            Ok(()) => info!("beoremote service unregistered"),
             Err(err) => {
                 // Not being able to connect is the normal state on a device without the patched
                 // bluetoothd, so it is logged at debug and reported as "waiting", not as broken.
@@ -194,23 +193,21 @@ pub async fn run(
     }
 }
 
-/// One session on the plugin socket: publish the menu, then serve writes until it closes.
-async fn serve_plugin(
+/// One session: register the service, publish the menu, then serve what the remote writes.
+async fn serve_remote(
     config: &BeoremoteConfig,
     statuses: &Registry,
     volume_tx: &mpsc::Sender<VolumeRequest>,
     hid_connected: &Arc<AtomicBool>,
 ) -> Result<()> {
     let api = BeoremoteApi::new(&config.api_base_url, config.zone_id)?;
-    let mut socket = UnixStream::connect(&config.plugin_socket)
-        .await
-        .with_context(|| format!("connect {}", config.plugin_socket.display()))?;
-    info!(
-        "beoremote bridge connected to {}",
-        config.plugin_socket.display()
-    );
+    // Room for a burst of writes: the remote sends a selection and its follow-ups back to back, and
+    // dropping one of those is a menu pick that silently does nothing.
+    let (writes_tx, mut writes) = mpsc::channel::<gatt::Write>(32);
+    let service = gatt::BeoremoteGatt::register(writes_tx).await?;
+    info!("beoremote service registered with bluez");
 
-    let mut published = publish(&mut socket, &api).await?;
+    let mut published = publish(&service, &api).await?;
     statuses.set_beoremote(Some(BeoremoteStatusReport {
         state: "connected".to_string(),
         zone_id: Some(config.zone_id),
@@ -219,26 +216,19 @@ async fn serve_plugin(
         last_error: None,
     }));
 
-    let mut buffer = Vec::new();
-    let mut chunk = [0u8; 1024];
     let mut menu_poll = tokio::time::interval(config.menu_poll);
     menu_poll.tick().await; // the first tick is immediate; we just published
 
     loop {
         tokio::select! {
-            read = socket.read(&mut chunk) => {
-                let read = read.context("read plugin socket")?;
-                if read == 0 {
+            write = writes.recv() => {
+                let Some((name, value)) = write else {
+                    service.unregister().await;
                     return Ok(());
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                while let Some((attribute, value, consumed)) = take_frame(&buffer) {
-                    buffer.drain(..consumed);
-                    if handle_write(attribute, &value, &api, &published, config, volume_tx).await {
-                        published =
-                            republish(&mut socket, &api, statuses, config, hid_connected, None)
-                                .await?;
-                    }
+                };
+                if handle_write(&name, &value, &api, &published, config, volume_tx).await {
+                    published =
+                        republish(&service, &api, statuses, config, hid_connected, None).await?;
                 }
             }
             _ = menu_poll.tick() => {
@@ -253,7 +243,7 @@ async fn serve_plugin(
                 };
                 if menu_changed(&published, &menu) {
                     info!("beoremote menu changed; republishing");
-                    published = republish(&mut socket, &api, statuses, config, hid_connected, Some(menu)).await?;
+                    published = republish(&service, &api, statuses, config, hid_connected, Some(menu)).await?;
                 }
             }
         }
@@ -278,7 +268,7 @@ fn menu_changed(published: &Published, menu: &Menu) -> bool {
         || published.submenu != menu.submenu_entries()
 }
 
-async fn publish(socket: &mut UnixStream, api: &BeoremoteApi) -> Result<Published> {
+async fn publish(service: &gatt::BeoremoteGatt, api: &BeoremoteApi) -> Result<Published> {
     let menu = match api.menu().await {
         Ok(menu) => menu,
         Err(err) => {
@@ -295,11 +285,11 @@ async fn publish(socket: &mut UnixStream, api: &BeoremoteApi) -> Result<Publishe
             }
         }
     };
-    write_menu(socket, &menu).await
+    write_menu(service, &menu).await
 }
 
 async fn republish(
-    socket: &mut UnixStream,
+    service: &gatt::BeoremoteGatt,
     api: &BeoremoteApi,
     statuses: &Registry,
     config: &BeoremoteConfig,
@@ -307,8 +297,8 @@ async fn republish(
     menu: Option<Menu>,
 ) -> Result<Published> {
     let published = match menu {
-        Some(menu) => write_menu(socket, &menu).await?,
-        None => publish(socket, api).await?,
+        Some(menu) => write_menu(service, &menu).await?,
+        None => publish(service, api).await?,
     };
     statuses.set_beoremote(Some(BeoremoteStatusReport {
         state: "connected".to_string(),
@@ -321,22 +311,20 @@ async fn republish(
 }
 
 /// Write the attributes the remote reads on connect, in the order it reads them.
-async fn write_menu(socket: &mut UnixStream, menu: &Menu) -> Result<Published> {
+async fn write_menu(service: &gatt::BeoremoteGatt, menu: &Menu) -> Result<Published> {
     let sources = menu.source_entries();
     let submenu = menu.submenu_entries();
 
-    set(socket, "VERSION", b"1.0").await?;
-    set(socket, "FEATURES", &protocol::FEATURES).await?;
+    service.set("VERSION", b"1.0");
+    service.set("FEATURES", &protocol::FEATURES);
     // An empty TV list suppresses the TV menu, which this is not.
-    set(socket, "TV_SOURCES", b"").await?;
-    set(socket, "MUSIC_SOURCES", &protocol::encode_sources(&sources)).await?;
-    set(
-        socket,
-        "SOURCE_CONTENT_1",
-        &protocol::encode_content(&submenu),
-    )
-    .await?;
-    set(socket, "FEATURES_CHANGED", &protocol::FEATURES_CHANGED).await?;
+    service.set("TV_SOURCES", b"");
+    service.set("MUSIC_SOURCES", &protocol::encode_sources(&sources));
+    service.set("SOURCE_CONTENT_1", &protocol::encode_content(&submenu));
+    // Last, and announced: this is the one the remote subscribes to, and it is what tells a remote
+    // that is already looking at the menu to read the lists again.
+    service.set("FEATURES_CHANGED", &protocol::FEATURES_CHANGED);
+    service.announce("FEATURES_CHANGED").await?;
 
     info!(
         "beoremote menu published: revision {:?}, {} sources, {} submenu items",
@@ -351,44 +339,16 @@ async fn write_menu(socket: &mut UnixStream, menu: &Menu) -> Result<Published> {
     })
 }
 
-async fn set(socket: &mut UnixStream, name: &str, value: &[u8]) -> Result<()> {
-    let Some(attribute) = protocol::attribute(name) else {
-        return Ok(());
-    };
-    socket
-        .write_all(&protocol::frame(attribute, value))
-        .await
-        .with_context(|| format!("write {}", name))?;
-    tokio::time::sleep(ATTRIBUTE_PACE).await;
-    Ok(())
-}
-
-/// Split one frame off the front of the buffer: attribute, value, and how many bytes it used.
-///
-/// The value is copied out rather than borrowed so the caller can drain the buffer in the same loop
-/// iteration -- a partial frame at the end has to survive to the next read.
-fn take_frame(buffer: &[u8]) -> Option<(u8, Vec<u8>, usize)> {
-    if buffer.len() < 3 {
-        return None;
-    }
-    let length = usize::from(u16::from_be_bytes([buffer[1], buffer[2]]));
-    if buffer.len() < 3 + length {
-        return None;
-    }
-    Some((buffer[0], buffer[3..3 + length].to_vec(), 3 + length))
-}
-
 /// Handle an attribute the remote wrote. Returns true when the menu has to be republished -- which
 /// happens when the server says the list moved since we rendered it.
 async fn handle_write(
-    attribute: u8,
+    name: &str,
     value: &[u8],
     api: &BeoremoteApi,
     published: &Published,
     config: &BeoremoteConfig,
     volume_tx: &mpsc::Sender<VolumeRequest>,
 ) -> bool {
-    let name = protocol::attribute_name(attribute).unwrap_or("UNKNOWN");
     match (name, value.len()) {
         ("ACTIVE_SOURCE", 1) => {
             let raw = value[0];
@@ -565,22 +525,6 @@ fn set_socket_permissions(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn frames_are_taken_one_at_a_time_and_partials_wait() {
-        let mut buffer = protocol::frame(22, &[21]);
-        buffer.extend_from_slice(&protocol::frame(44, &[40]));
-        let (attribute, value, consumed) = take_frame(&buffer).expect("first frame");
-        assert_eq!(attribute, 22);
-        assert_eq!(value, vec![21]);
-        let rest = &buffer[consumed..];
-        let (attribute, value, consumed) = take_frame(rest).expect("second frame");
-        assert_eq!(attribute, 44);
-        assert_eq!(value, vec![40]);
-        assert!(take_frame(&rest[consumed..]).is_none());
-        // A header without its value yet is not a frame.
-        assert!(take_frame(&[22, 0x00, 0x04, 1, 2]).is_none());
-    }
 
     #[test]
     fn a_menu_is_republished_only_when_it_really_changed() {
