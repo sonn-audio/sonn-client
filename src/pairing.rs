@@ -18,7 +18,7 @@ use anyhow::{anyhow, Context, Result};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How long to leave the window open. Long enough to walk to the remote and hold its buttons.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(90);
@@ -100,12 +100,26 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Paired
         None => discover_remote(window).await?,
     };
 
+    // Whatever this adapter thinks it knows about the remote goes first.
+    //
+    // A bond has two halves, and only one of them is here. Clearing it on the remote -- which is
+    // what someone does when pairing stopped working -- leaves this side convinced the two are
+    // still paired, so `pair` opens a link the remote refuses, which reads as a failed pairing with
+    // nothing to act on. Pressing pair means "start over", so this starts over.
+    if let Err(err) = run_bluetoothctl(&["remove".to_string(), target.address.clone()]).await {
+        // Not knowing it is the normal case, and the message says so plainly.
+        debug!("nothing to forget for {}: {:#}", target.address, err);
+    } else {
+        info!("forgot the previous pairing for {}", target.address);
+    }
+
     // Three separate one-shot calls with a timeout each, rather than one script.
     //
     // Pairing is asynchronous: bluetoothctl accepts `pair` and the result arrives later, so a script
     // that sends pair, trust, connect and quit back to back can quit before the pairing it asked for
     // has been answered. `--timeout` is what makes each call wait for its own result.
     let addr = target.address.as_str();
+    info!("pairing {}", addr);
     let paired = run_bluetoothctl(&[
         "--timeout".to_string(),
         PAIR_TIMEOUT_S.to_string(),
@@ -163,7 +177,10 @@ async fn discover_remote(window: Duration) -> Result<PairedDevice> {
     // stdin, and closing stdin -- which is what happens the moment the script is written -- makes it
     // exit. That is how this scanned for fourteen milliseconds and reported that nothing was
     // advertising.
-    let seconds = window.as_secs().clamp(5, 60);
+    // Half the window, so the pairing that follows has the other half. Scanning for the whole
+    // window guarantees the outer timeout fires mid-pair, which is a pairing that reports nothing
+    // at all -- the worst of both.
+    let seconds = (window.as_secs() / 2).clamp(10, 45);
     info!("scanning {}s for a {}* remote", seconds, REMOTE_NAME_PREFIX);
     let scanned = run_bluetoothctl(&[
         "--timeout".to_string(),
