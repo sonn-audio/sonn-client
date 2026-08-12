@@ -196,6 +196,13 @@ impl BeoremoteApi {
             debug!("key {code} is not assigned on the server");
             return Ok(None);
         }
+        // 409 is the server saying the button is bound but there is nothing behind it -- an empty
+        // favorite slot, say. That is an answer, not a failure, and logging it as one sends someone
+        // looking for a fault in the remote.
+        if response.status().as_u16() == 409 {
+            debug!("key {code} is bound to something empty");
+            return Ok(Some("nothing to play".to_string()));
+        }
         let response = response.error_for_status().context("key response status")?;
         // `name` is only there for a key that starts something named -- a favorite, a station. A
         // transport key answers with its action and no name, and reading that as "nothing happened"
