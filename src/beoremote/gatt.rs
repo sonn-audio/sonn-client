@@ -153,6 +153,13 @@ trait GattManager {
 
 type Values = Arc<Mutex<HashMap<String, Vec<u8>>>>;
 
+/// The connection our application is registered on.
+///
+/// bluez lets only the client that registered an application take it back: asking from a fresh
+/// connection is answered with `DoesNotExist` and changes nothing, which is how a "graceful" exit
+/// still left the service occupying its handles.
+static OWNER: Mutex<Option<Connection>> = Mutex::new(None);
+
 /// A write the remote made, as an attribute name and its value.
 pub type Write = (String, Vec<u8>);
 
@@ -318,8 +325,15 @@ impl NotifyingCharacteristic {
 /// even Service Changed, so it goes on writing to where the service used to be. Menu picks then
 /// vanish with no error at either end.
 pub async fn unregister_leftovers() {
-    let Ok(connection) = Connection::system().await else {
-        return;
+    // The connection this process registered on, if it still has one. Anything else can only ask
+    // about somebody else's application, which bluez rightly refuses.
+    let owned = OWNER.lock().ok().and_then(|owner| owner.clone());
+    let connection = match owned {
+        Some(connection) => connection,
+        None => match Connection::system().await {
+            Ok(connection) => connection,
+            Err(_) => return,
+        },
     };
     let Ok(path) = ObjectPath::try_from(APP_PATH) else {
         return;
@@ -480,6 +494,10 @@ impl BeoremoteGatt {
                 .map(|owner| owner.to_string()),
             Err(_) => None,
         };
+
+        if let Ok(mut slot) = OWNER.lock() {
+            *slot = Some(connection.clone());
+        }
 
         Ok(Self {
             connection,

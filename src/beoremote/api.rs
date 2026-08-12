@@ -79,6 +79,9 @@ struct SelectResponse {
 struct KeyResponse {
     #[serde(default)]
     name: Option<String>,
+    /// What the server did with it, for the keys that start nothing named.
+    #[serde(default)]
+    action: Option<String>,
 }
 
 #[derive(Clone)]
@@ -194,7 +197,10 @@ impl BeoremoteApi {
             return Ok(None);
         }
         let response = response.error_for_status().context("key response status")?;
+        // `name` is only there for a key that starts something named -- a favorite, a station. A
+        // transport key answers with its action and no name, and reading that as "nothing happened"
+        // is what made working keys look dead in the log.
         let parsed = response.json::<KeyResponse>().await.ok();
-        Ok(parsed.and_then(|body| body.name))
+        Ok(parsed.and_then(|body| body.name.or(body.action)))
     }
 }

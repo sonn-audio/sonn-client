@@ -40,6 +40,12 @@ const KEY_PRESS: i32 = 1;
 const KEY_VOLUME_UP: u16 = 115;
 const KEY_VOLUME_DOWN: u16 = 114;
 
+/// What a reader thread reports: a press, or that its device is gone.
+enum Event {
+    Key(u16),
+    Closed(PathBuf),
+}
+
 /// One `struct input_event`: a timeval, then type, code and value.
 const EVENT_SIZE: usize = std::mem::size_of::<libc_input_event>();
 
@@ -63,7 +69,7 @@ pub async fn run(
     statuses: Registry,
 ) {
     let api = BeoremoteApi::new(&api_base_url, zone_id).ok();
-    let (keys_tx, mut keys) = mpsc::channel::<u16>(64);
+    let (keys_tx, mut keys) = mpsc::channel::<Event>(64);
     let mut open: HashSet<PathBuf> = HashSet::new();
     let mut rescan = tokio::time::interval(RESCAN_INTERVAL);
 
@@ -86,9 +92,21 @@ pub async fn run(
                     }
                 }
             }
-            key = keys.recv() => {
-                let Some(code) = key else { return };
-                handle(code, &api, &volume_player, volume_step, &volume_tx).await;
+            event = keys.recv() => {
+                match event {
+                    None => return,
+                    Some(Event::Key(code)) => {
+                        handle(code, &api, &volume_player, volume_step, &volume_tx).await;
+                    }
+                    // Re-pairing the remote destroys its input devices and the kernel makes new ones
+                    // under the same names. Forgetting the path is what lets the rescan pick the new
+                    // device up; without it the keys stop at the next pairing and never come back.
+                    Some(Event::Closed(path)) => {
+                        debug!("beoremote input {} went away", path.display());
+                        open.remove(&path);
+                        statuses.set_beoremote_hid(!open.is_empty());
+                    }
+                }
             }
         }
     }
@@ -166,20 +184,21 @@ fn device_name(path: &Path) -> Option<String> {
 ///
 /// A thread rather than an async reader: these are blocking character devices, they are idle almost
 /// all the time, and there are three of them.
-fn spawn_reader(path: PathBuf, keys: mpsc::Sender<u16>) -> Result<()> {
+fn spawn_reader(path: PathBuf, keys: mpsc::Sender<Event>) -> Result<()> {
     let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     grab(&file).with_context(|| format!("grab {}", path.display()))?;
 
     std::thread::spawn(move || {
         let mut buffer = [0u8; EVENT_SIZE * 16];
-        loop {
+        let ended = loop {
             let read = match file.read(&mut buffer) {
-                Ok(0) => break,
+                Ok(0) => break true,
                 Ok(read) => read,
-                // The remote went to sleep and its node went with it; the rescan opens the new one.
+                // The remote slept, or was paired again and its devices were rebuilt; either way the
+                // rescan opens whatever the kernel puts there next.
                 Err(err) => {
                     debug!("beoremote input {} ended: {err}", path.display());
-                    break;
+                    break true;
                 }
             };
             for chunk in buffer[..read].chunks_exact(EVENT_SIZE) {
@@ -187,10 +206,13 @@ fn spawn_reader(path: PathBuf, keys: mpsc::Sender<u16>) -> Result<()> {
                 if event.kind != EV_KEY || event.value != KEY_PRESS {
                     continue;
                 }
-                if keys.blocking_send(event.code).is_err() {
+                if keys.blocking_send(Event::Key(event.code)).is_err() {
                     return;
                 }
             }
+        };
+        if ended {
+            let _ = keys.blocking_send(Event::Closed(path));
         }
     });
     Ok(())
