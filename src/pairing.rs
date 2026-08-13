@@ -39,10 +39,25 @@ const DEFAULT_WINDOW: Duration = Duration::from_secs(90);
 /// B&O remotes advertise with this name prefix, which is also what the daemon's legacy-GATT check
 /// looks for.
 const REMOTE_NAME_PREFIX: &str = "BEORC";
+/// The Beoremote Essence advertises under the name of the product it shipped with, so it needs
+/// naming separately. It is a remote all the same: BLE HID, appearance 0x03c0, five buttons and a
+/// wheel. B&O's own BlueZ patches single it out by this exact string.
+const ESSENCE_NAME: &str = "BeoSound Essence";
 /// Where our agent lives on the bus. Anything unclaimed will do; this says who it belongs to.
 const AGENT_PATH: &str = "/sonn/agent";
-/// No screen, no keypad: accept whatever the remote proposes.
-const AGENT_CAPABILITY: &str = "NoInputNoOutput";
+/// What this box claims it can do during pairing.
+///
+/// `KeyboardDisplay`, not the honest `NoInputNoOutput`, and the difference decides whether a
+/// Beoremote Essence can pair at all. Both ends of that pairing ask for MITM protection, and MITM
+/// cannot be satisfied by just-works — the only method two `NoInputNoOutput` peers can agree on. So
+/// the negotiation fails: measured, every attempt died about 150 ms after our authorisation with
+/// SMP status 0x05, "authentication requirements".
+///
+/// Claiming a keyboard and a display we do not have is safe because the methods it unlocks are
+/// answered below in software: a numeric comparison is confirmed (nobody can read the number off a
+/// remote with no screen), and a passkey we would have to type is offered as zero rather than
+/// pretended. A Beoremote One pairs just-works either way.
+const AGENT_CAPABILITY: &str = "KeyboardDisplay";
 const BLUEZ: &str = "org.bluez";
 /// How long to wait for the adapter to answer a pairing request. Pairing itself takes seconds; this
 /// is the point at which the remote clearly is not answering.
@@ -184,7 +199,7 @@ pub async fn pair_remote(
                      PAIRING) and try again while its screen says it is open for pairing",
                     match &address {
                         Some(address) => format!("{address} never"),
-                        None => format!("no {REMOTE_NAME_PREFIX}* remote"),
+                        None => "no remote".to_string(),
                     },
                     window.as_secs()
                 )),
@@ -407,7 +422,7 @@ pub async fn paired_remotes(connection: &Connection) -> Vec<PairedRemote> {
             let name = string_property(properties, "Alias")
                 .or_else(|| string_property(properties, "Name"))
                 .unwrap_or_default();
-            if !name.starts_with(REMOTE_NAME_PREFIX) {
+            if !is_remote_name(&name) {
                 return None;
             }
             Some(PairedRemote {
@@ -455,12 +470,17 @@ pub async fn forget_remote(address: &str) -> Result<()> {
     Err(anyhow!("{address} is not paired to this device"))
 }
 
+/// Whether a name belongs to a remote this client knows how to serve.
+fn is_remote_name(name: &str) -> bool {
+    name.starts_with(REMOTE_NAME_PREFIX) || name == ESSENCE_NAME
+}
+
 /// Decide whether a discovered device is the remote we are waiting for.
 ///
 /// Matching is on the name, or on an address the caller asked for by hand -- and on nothing else.
-/// An HID service looks like the obvious filter and is not one: a BeoSound Essence advertises the
-/// same `00001812` service, and using it meant this grabbed the speaker in the living room
-/// 14 milliseconds after opening the window.
+/// An HID service looks like the obvious filter and is not one: every Bluetooth keyboard in the
+/// house advertises the same `00001812`, and using it meant this grabbed a speaker in the living
+/// room 14 milliseconds after opening the window.
 fn candidate_from(
     path: &OwnedObjectPath,
     properties: &Properties,
@@ -471,18 +491,22 @@ fn candidate_from(
 
     let wanted = match target {
         Some(target) => address.eq_ignore_ascii_case(target),
-        None => name
-            .as_deref()
-            .is_some_and(|name| name.to_uppercase().starts_with(REMOTE_NAME_PREFIX)),
+        None => name.as_deref().is_some_and(is_remote_name),
     };
     if !wanted {
         return None;
     }
 
-    // No RSSI means BlueZ is showing a remembered device rather than one that is transmitting right
-    // now, and connecting to a remote that is asleep just burns the window waiting for a link that
-    // cannot be established. Wait for it to actually say something.
-    if !properties.contains_key("RSSI") {
+    // Proof that it is actually there, one way or the other.
+    //
+    // RSSI means BlueZ heard it just now. Without it, a device entry is usually one BlueZ remembers,
+    // and connecting to a remote that is asleep burns the window on a link that cannot be made. But
+    // an already-connected device has no RSSI either and is as present as it gets -- an Essence
+    // whose battery was reinserted gets picked up by the kernel before anyone opens this window, and
+    // then waiting for an advertisement waits forever.
+    let present =
+        properties.contains_key("RSSI") || bool_property(properties, "Connected").unwrap_or(false);
+    if !present {
         return None;
     }
 
@@ -518,7 +542,7 @@ async fn forget_existing_bonds(
             .unwrap_or_default();
         let ours = match target {
             Some(target) => address.eq_ignore_ascii_case(target),
-            None => name.to_uppercase().starts_with(REMOTE_NAME_PREFIX),
+            None => is_remote_name(&name),
         };
         if !ours || !bool_property(properties, "Paired").unwrap_or(false) {
             continue;
@@ -675,21 +699,56 @@ mod tests {
     }
 
     #[test]
-    fn other_bluetooth_things_are_not_remotes() {
-        // A BeoSound Essence is a Bluetooth HID device too, which is precisely why the service list
-        // is not part of the decision.
+    fn a_connected_remote_counts_as_present() {
+        // No RSSI, because BlueZ is not hearing advertisements from something it already has a link
+        // to. Waiting for one would wait forever, which is exactly what happened to an Essence the
+        // kernel had auto-connected before the window opened.
+        let connected = properties(&[
+            ("Address", owned("64:CF:D9:1B:AA:FC")),
+            ("Alias", owned("BeoSound Essence")),
+            ("Connected", owned(true)),
+        ]);
+        assert!(candidate_from(&path(), &connected, None).is_some());
+
+        // Remembered and silent is still not present.
+        let asleep = properties(&[
+            ("Address", owned("64:CF:D9:1B:AA:FC")),
+            ("Alias", owned("BeoSound Essence")),
+            ("Connected", owned(false)),
+        ]);
+        assert!(candidate_from(&path(), &asleep, None).is_none());
+    }
+
+    #[test]
+    fn a_beoremote_essence_is_a_remote_too() {
+        // It advertises under the name of the product it shipped with, which reads like a speaker
+        // and is not one: BLE HID, appearance 0x03c0, a wheel and five buttons. B&O's own BlueZ
+        // patches single out this exact string for the same reason.
         let essence = properties(&[
             ("Address", owned("64:CF:D9:1B:AA:FC")),
             ("Alias", owned("BeoSound Essence")),
             ("RSSI", owned(-70i16)),
         ]);
-        assert!(candidate_from(&path(), &essence, None).is_none());
+        let found = candidate_from(&path(), &essence, None);
+        assert_eq!(found.expect("the essence").address, "64:CF:D9:1B:AA:FC");
+    }
+
+    #[test]
+    fn other_bluetooth_things_are_not_remotes() {
+        // Everything with a keyboard service is not a remote, which is why the service list is not
+        // part of the decision -- a speaker in the same room advertises one too.
+        let speaker = properties(&[
+            ("Address", owned("50:1E:2D:00:6E:24")),
+            ("Alias", owned("BeoSound Shape")),
+            ("RSSI", owned(-55i16)),
+        ]);
+        assert!(candidate_from(&path(), &speaker, None).is_none());
 
         // Unless it is the one that was asked for by address, which is the manual override.
-        let found = candidate_from(&path(), &essence, Some("64:cf:d9:1b:aa:fc"));
+        let found = candidate_from(&path(), &speaker, Some("50:1e:2d:00:6e:24"));
         assert_eq!(
             found.expect("the named device").address,
-            "64:CF:D9:1B:AA:FC"
+            "50:1E:2D:00:6E:24"
         );
     }
 
