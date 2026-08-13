@@ -261,6 +261,25 @@ impl Agent {
     }
 }
 
+/// Whether a paired device is something that plays audio to us.
+///
+/// A phone offers Audio *Source*; a remote offers a keyboard and a battery. The service list is the
+/// honest way to tell them apart -- better than a name, which is a phone's to choose.
+fn offers_audio(properties: &Properties) -> bool {
+    let Some(uuids) = properties.get("UUIDs") else {
+        return false;
+    };
+    let Ok(uuids) = Vec::<String>::try_from(uuids.clone()) else {
+        return false;
+    };
+    uuids
+        .iter()
+        .any(|uuid| uuid.to_ascii_lowercase().starts_with(A2DP_SOURCE))
+}
+
+/// A2DP Source: "I have audio to send you", which is what a phone says and a remote does not.
+const A2DP_SOURCE: &str = "0000110a";
+
 /// A2DP source and sink, AVRCP, and the two audio/video umbrella UUIDs a phone offers alongside.
 fn is_audio_service(uuid: &str) -> bool {
     const AUDIO: [&str; 6] = [
@@ -453,6 +472,12 @@ async fn inspect(
                 if !bool_property(properties, "Paired").unwrap_or(false) {
                     continue;
                 }
+                // Only things that can play *to* us. Everything paired to this adapter shows up
+                // here otherwise -- including the Beoremote One, listed as a phone, with a button
+                // beside it that would unpair the room's remote.
+                if !offers_audio(properties) {
+                    continue;
+                }
                 let address = string_property(properties, "Address").unwrap_or_default();
                 report.devices.push(PairedPhone {
                     name: string_property(properties, "Alias")
@@ -596,6 +621,32 @@ mod tests {
         // And nothing else has any business here.
         assert!(!is_audio_service("00001105-0000-1000-8000-00805f9b34fb"));
         assert!(!is_audio_service("00001812-0000-1000-8000-00805f9b34fb"));
+    }
+
+    #[test]
+    fn only_things_that_can_play_to_us_count_as_phones() {
+        let uuids = |list: &[&str]| {
+            let values: Vec<String> = list.iter().map(|uuid| (*uuid).to_string()).collect();
+            Properties::from([(
+                "UUIDs".to_string(),
+                OwnedValue::try_from(zbus::zvariant::Value::from(values)).expect("uuids"),
+            )])
+        };
+
+        // A phone: it has audio to send.
+        assert!(offers_audio(&uuids(&[
+            "0000110a-0000-1000-8000-00805f9b34fb",
+            "0000110e-0000-1000-8000-00805f9b34fb",
+        ])));
+        // A Beoremote One: a keyboard and a battery. Listing it as a phone puts a "forget" button
+        // next to the room's remote.
+        assert!(!offers_audio(&uuids(&[
+            "00001812-0000-1000-8000-00805f9b34fb",
+            "0000180f-0000-1000-8000-00805f9b34fb",
+        ])));
+        // A speaker offers a Sink, not a Source: it cannot play to us either.
+        assert!(!offers_audio(&uuids(&["0000110b-0000-1000-8000-00805f9b34fb"])));
+        assert!(!offers_audio(&Properties::new()));
     }
 
     #[test]
