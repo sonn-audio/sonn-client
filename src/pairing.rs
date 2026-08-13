@@ -23,7 +23,7 @@
 //! `trust` is the step that is easy to forget and annoying to debug: without it every reconnect needs
 //! re-authorising, so a remote works once and then appears dead.
 
-use crate::models::PairingStatusReport;
+use crate::models::{PairedRemote, PairingStatusReport};
 use crate::status::Registry;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
@@ -387,6 +387,72 @@ async fn watch_for_remote(connection: &Connection, target: Option<&str>) -> Resu
         }
         sleep(POLL_INTERVAL).await;
     }
+}
+
+/// The remotes this device has paired, whether or not one is in the room right now.
+///
+/// Same rule as pairing uses to recognise one, and for the same reason: the name. An HID service
+/// looks like the obvious filter and is not one -- a BeoSound Essence advertises it too.
+pub async fn paired_remotes(connection: &Connection) -> Vec<PairedRemote> {
+    let Ok(objects) = managed_objects(connection).await else {
+        return Vec::new();
+    };
+    let mut remotes: Vec<PairedRemote> = objects
+        .into_values()
+        .filter_map(|interfaces| {
+            let properties = interfaces.get("org.bluez.Device1")?;
+            if !bool_property(properties, "Paired").unwrap_or(false) {
+                return None;
+            }
+            let name = string_property(properties, "Alias")
+                .or_else(|| string_property(properties, "Name"))
+                .unwrap_or_default();
+            if !name.starts_with(REMOTE_NAME_PREFIX) {
+                return None;
+            }
+            Some(PairedRemote {
+                address: string_property(properties, "Address")?,
+                name,
+                connected: bool_property(properties, "Connected").unwrap_or(false),
+            })
+        })
+        .collect();
+    // Connected first, then by address, so the one in someone's hand is at the top and the order
+    // does not shuffle between polls.
+    remotes.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| a.address.cmp(&b.address))
+    });
+    remotes
+}
+
+/// Forget one remote, so a replacement can take its place.
+pub async fn forget_remote(address: &str) -> Result<()> {
+    let connection = Connection::system()
+        .await
+        .context("talk to bluez (is bluetoothd running?)")?;
+    let adapter_path = first_adapter(&connection).await?;
+    let adapter = AdapterProxy::builder(&connection)
+        .path(adapter_path)?
+        .build()
+        .await
+        .context("talk to the adapter")?;
+    for (path, interfaces) in managed_objects(&connection).await? {
+        let Some(properties) = interfaces.get("org.bluez.Device1") else {
+            continue;
+        };
+        if string_property(properties, "Address").as_deref() != Some(address) {
+            continue;
+        }
+        adapter
+            .remove_device(&path.as_ref())
+            .await
+            .with_context(|| format!("forget {address}"))?;
+        info!("forgot remote {address}");
+        return Ok(());
+    }
+    Err(anyhow!("{address} is not paired to this device"))
 }
 
 /// Decide whether a discovered device is the remote we are waiting for.

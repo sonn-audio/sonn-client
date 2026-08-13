@@ -74,6 +74,26 @@ impl BeoremoteConfig {
     }
 }
 
+/// The paired remotes, as last read from bluez.
+type Remotes = Arc<std::sync::Mutex<Vec<crate::models::PairedRemote>>>;
+
+/// Read the paired list again. Quiet on failure: bluez being briefly unavailable is the same state
+/// as having no remotes, and the next tick asks again.
+async fn refresh_remotes(remotes: &Remotes) {
+    let Ok(connection) = zbus::Connection::system().await else {
+        return;
+    };
+    let found = crate::pairing::paired_remotes(&connection).await;
+    if let Ok(mut slot) = remotes.lock() {
+        *slot = found;
+    }
+}
+
+/// A copy for a status report.
+fn paired(remotes: &Remotes) -> Vec<crate::models::PairedRemote> {
+    remotes.lock().map(|slot| slot.clone()).unwrap_or_default()
+}
+
 /// Run the bridge until told to stop. Returns only on shutdown; connection loss is retried inside.
 pub async fn run(
     config: BeoremoteConfig,
@@ -81,6 +101,9 @@ pub async fn run(
     volume_tx: mpsc::Sender<VolumeRequest>,
 ) {
     let hid_connected = Arc::new(AtomicBool::new(false));
+    // Which remotes are paired changes when somebody pairs or forgets one, so it is read on the menu
+    // poll rather than on every report -- the answer costs a walk over every bluez object.
+    let remotes: Remotes = Arc::new(std::sync::Mutex::new(Vec::new()));
 
     // Keys come from the kernel's input devices: on a stock BlueZ the remote is an ordinary HID
     // peripheral, and there is no vendor socket in the path at all.
@@ -94,15 +117,17 @@ pub async fn run(
     ));
 
     loop {
+        refresh_remotes(&remotes).await;
         statuses.set_beoremote(Some(BeoremoteStatusReport {
             state: "waiting".to_string(),
             zone_id: Some(config.zone_id),
             menu_revision: None,
             hid_connected: hid_connected.load(Ordering::Relaxed),
+            devices: paired(&remotes),
             last_error: None,
         }));
 
-        match serve_remote(&config, &statuses, &volume_tx, &hid_connected).await {
+        match serve_remote(&config, &statuses, &volume_tx, &hid_connected, &remotes).await {
             Ok(()) => info!("beoremote service unregistered"),
             Err(err) => {
                 // Not being able to connect is the normal state on a device without the patched
@@ -113,6 +138,7 @@ pub async fn run(
                     zone_id: Some(config.zone_id),
                     menu_revision: None,
                     hid_connected: hid_connected.load(Ordering::Relaxed),
+                    devices: paired(&remotes),
                     last_error: Some(format!("{:#}", err)),
                 }));
             }
@@ -127,6 +153,7 @@ async fn serve_remote(
     statuses: &Registry,
     volume_tx: &mpsc::Sender<VolumeRequest>,
     hid_connected: &Arc<AtomicBool>,
+    remotes: &Remotes,
 ) -> Result<()> {
     let api = BeoremoteApi::new(&config.api_base_url, config.zone_id)?;
     // Room for a burst of writes: the remote sends a selection and its follow-ups back to back, and
@@ -141,6 +168,7 @@ async fn serve_remote(
         zone_id: Some(config.zone_id),
         menu_revision: published.revision.clone(),
         hid_connected: hid_connected.load(Ordering::Relaxed),
+        devices: paired(remotes),
         last_error: None,
     }));
 
@@ -156,7 +184,8 @@ async fn serve_remote(
                 };
                 if handle_write(&name, &value, &api, &published, config, volume_tx).await {
                     published =
-                        republish(&service, &api, statuses, config, hid_connected, None).await?;
+                        republish(&service, &api, statuses, config, hid_connected, remotes, None)
+                            .await?;
                 }
             }
             // bluetoothd going away takes the registration with it; the outer loop puts it back.
@@ -165,6 +194,7 @@ async fn serve_remote(
                 return Ok(());
             }
             _ = menu_poll.tick() => {
+                refresh_remotes(remotes).await;
                 // Re-read every tick and only republish on a real change: the remote is not
                 // disturbed for nothing, and a new favourite still shows up within one interval.
                 let menu = match api.menu().await {
@@ -176,7 +206,9 @@ async fn serve_remote(
                 };
                 if menu_changed(&published, &menu) {
                     info!("beoremote menu changed; republishing");
-                    published = republish(&service, &api, statuses, config, hid_connected, Some(menu)).await?;
+                    published =
+                        republish(&service, &api, statuses, config, hid_connected, remotes, Some(menu))
+                            .await?;
                 }
             }
         }
@@ -227,6 +259,7 @@ async fn republish(
     statuses: &Registry,
     config: &BeoremoteConfig,
     hid_connected: &Arc<AtomicBool>,
+    remotes: &Remotes,
     menu: Option<Menu>,
 ) -> Result<Published> {
     let published = match menu {
@@ -238,6 +271,7 @@ async fn republish(
         zone_id: Some(config.zone_id),
         menu_revision: published.revision.clone(),
         hid_connected: hid_connected.load(Ordering::Relaxed),
+        devices: paired(remotes),
         last_error: None,
     }));
     Ok(published)

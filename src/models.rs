@@ -131,8 +131,23 @@ pub struct BeoremoteStatusReport {
     pub menu_revision: Option<String>,
     /// Whether B&O's key socket has a peer -- when false, keys go to the kernel as evdev instead.
     pub hid_connected: bool,
+    /// The remotes paired to this device, in the room or not.
+    ///
+    /// Pairing one is easy to repeat and hard to undo from a remote that has no screen for it, so
+    /// the list is worth showing: three BEORCs on a device usually means two of them are ghosts of
+    /// an earlier attempt, and only this end can say so.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub devices: Vec<PairedRemote>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// One remote this device has paired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PairedRemote {
+    pub address: String,
+    pub name: String,
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -485,6 +485,20 @@ async fn handle_builtin_command(
             });
             true
         }
+        // Forget one remote. Pairing another is a button away, and a device that has collected
+        // three BEORCs from earlier attempts has no way to say so for itself.
+        "forget_remote" => {
+            let Some(address) = command.args.first().cloned() else {
+                warn!("forget_remote needs the address of the remote to forget");
+                return true;
+            };
+            tokio::spawn(async move {
+                if let Err(err) = pairing::forget_remote(&address).await {
+                    warn!("could not forget {address}: {err:#}");
+                }
+            });
+            true
+        }
         // Be findable for the window the zone configured. Nothing else opens it: a speaker that is
         // permanently discoverable is one every passer-by can see.
         "bluetooth_discoverable" => {
