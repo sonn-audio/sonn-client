@@ -1,3 +1,17 @@
+# [1.9.0](https://github.com/sonn-audio/sonn-client/compare/v1.8.0...v1.9.0) (2026-08-13)
+
+
+### Bug Fixes
+
+* **pairing:** find the remote again after clearing its old bond ([9418a19](https://github.com/sonn-audio/sonn-client/commit/9418a19d87ce6eec5ef50fc0c426cb957384c637))
+* **remote:** show a changed menu without waiting for the next key press ([8c7dae3](https://github.com/sonn-audio/sonn-client/commit/8c7dae3dae9e92ab20581ff9720e2a013b70214e))
+
+
+### Features
+
+* **discovery:** announce to every server, attach to the one that claims this device ([bd133b4](https://github.com/sonn-audio/sonn-client/commit/bd133b41072071938cfa16f311d451fd9da4d10a))
+* **remote:** listen to the models the room asked for ([3551bfd](https://github.com/sonn-audio/sonn-client/commit/3551bfdf1fc76d0f0150a6438598e5dea3c40de4))
+
 # [1.8.0](https://github.com/sonn-audio/sonn-client/compare/v1.7.0...v1.8.0) (2026-08-13)
 
 
