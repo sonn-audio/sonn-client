@@ -34,7 +34,13 @@ use tracing::{debug, info, warn};
 /// of the product it shipped with.
 const REMOTE_NAMES: [&str; 2] = ["BEORC", "BeoSound Essence"];
 /// How often to look for input devices that appeared or went away.
-const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
+///
+/// Twice a second, because a remote's whole visit can be shorter than that. An Essence wakes on a
+/// key press, connects, sends its report and hangs up again -- measured at about a second from link
+/// to disconnect -- and the input device the kernel builds for it lives exactly that long. A
+/// five-second sweep misses nearly every one of them. Reading a directory of a dozen entries is
+/// nothing next to sitting out a key press.
+const RESCAN_INTERVAL: Duration = Duration::from_millis(500);
 /// `EV_KEY`, the only event type worth reading here.
 const EV_KEY: u16 = 0x01;
 /// A press. Releases are 0 and auto-repeats are 2; both are ignored, because the server acts on the
