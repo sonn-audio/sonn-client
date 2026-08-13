@@ -88,6 +88,23 @@ pub struct ClientRegisterRequest {
     /// What is installed of the managed components, so the server knows whether to offer the
     /// features that depend on them.
     pub components: Vec<ComponentStatus>,
+    /// Every audioserver this device found, so each knows whether it is the only candidate.
+    ///
+    /// Alone, a server takes the device on and nothing has changed for the ordinary house. One of
+    /// several, it offers the device on its screen and waits: which core a speaker belongs to is a
+    /// person's answer, not a race between mDNS replies.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<DiscoveredServerInfo>,
+    /// Set when announcing to a server that did *not* get this device, so it can let go.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+}
+
+/// One audioserver this device can see, as it advertised itself.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredServerInfo {
+    pub name: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,8 +243,25 @@ pub struct PlayerStatusReport {
 
 /// The server's desired state for this device. Returned by both register and status, so every poll
 /// is also a config fetch.
+/// A server too old to answer the question only ever spoke to devices it had taken on, so silence
+/// means yes. See [`DesiredConfig::claimed`].
+fn claimed_by_default() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DesiredConfig {
+    /// Whether the server that answered is running this device.
+    ///
+    /// Absent from servers too old to know the question, which is read as yes: they only ever
+    /// answered devices they had taken on. False means it is waiting to be picked, and everything
+    /// else in this answer is empty.
+    #[serde(default = "claimed_by_default")]
+    pub claimed: bool,
+    /// When that server last heard from the device it claims. Only used to settle the rare case of
+    /// two servers both believing they have it.
+    #[serde(default)]
+    pub claimed_at: Option<String>,
     /// Friendly device name. Only used for logs and as a fallback player name.
     #[serde(default)]
     pub device_name: Option<String>,

@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
@@ -151,9 +151,7 @@ async fn run() -> Result<()> {
     // Outer loop: attach to a server, run until contact is lost, start over. A server that is
     // rebooted, renamed or moved to another address needs no help from anyone here.
     loop {
-        let server = resolve_server(&config, &declined).await;
-        let api = ServerApi::new(&server.base_url, &server.register_path, &server.status_path)?;
-        info!("attaching to {}", api.base_url());
+        let candidates = discover_candidates(&config, &declined).await;
 
         let outputs = devices::list_output_devices().unwrap_or_else(|err| {
             // Reported as no outputs rather than fatal: the device still registers, so the server can
@@ -165,23 +163,24 @@ async fn run() -> Result<()> {
             warn!("could not enumerate audio inputs: {:#}", err);
             Vec::new()
         });
-        let request = build_register_request(&config, &identity, &outputs, &inputs, &statuses);
-        let desired = match register(&api, &request).await {
-            Registration::Accepted(desired) => *desired,
-            Registration::NotSupported => {
-                declined.insert(api.base_url().to_string(), Instant::now());
-                // A pinned server is not skipped and discovery is not run, so nothing else would
-                // slow this loop down. Wait before asking the same server the same question.
-                if is_pinned(&config) {
-                    tokio::time::sleep(DISCOVERY_BACKOFF).await;
-                }
-                continue;
-            }
-            Registration::Unreachable => {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                continue;
-            }
+        let mut request = build_register_request(&config, &identity, &outputs, &inputs, &statuses);
+        request.servers = candidates
+            .iter()
+            .map(|server| models::DiscoveredServerInfo {
+                name: server.instance_name.clone(),
+                url: server.base_url.clone(),
+            })
+            .collect();
+
+        let Some((server, api, desired)) =
+            announce(&candidates, &request, &mut declined, &config).await
+        else {
+            // Nobody has this device: either nothing answered, or every server that did is waiting
+            // for somebody to say it is theirs. Announcing again is what keeps it on their screens.
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            continue;
         };
+        info!("attaching to {}", api.base_url());
 
         hooks
             .connection_event("connected", api.base_url(), &server.instance_name)
@@ -226,16 +225,21 @@ async fn run() -> Result<()> {
     }
 }
 
-/// A server pinned in config.toml, or whatever mDNS turns up. Never gives up: a device that boots
+/// A server pinned in config.toml, or every one mDNS turns up. Never gives up: a device that boots
 /// before the network is a normal event.
 ///
+/// All of them, not the first: this device announces itself to every audioserver it can see, and
+/// the one that is given it answers that it is. Picking the fastest to reply was fine while a house
+/// had one core and wrong the moment it had two -- the same speaker could land on a different one
+/// after every restart.
+///
 /// `declined` holds the servers that answered "no such endpoint". They are skipped while that answer
-/// is still fresh, so a network with two audioservers -- one upgraded, one not -- settles on the one
-/// that can actually use this device instead of retrying the other every few seconds forever.
-async fn resolve_server(
+/// is still fresh, so a network with two audioservers -- one upgraded, one not -- stops asking the
+/// one that cannot use this device at all.
+async fn discover_candidates(
     config: &config::Config,
     declined: &HashMap<String, Instant>,
-) -> DiscoveredServer {
+) -> Vec<DiscoveredServer> {
     if let Some(url) = config
         .server_url
         .as_deref()
@@ -244,7 +248,7 @@ async fn resolve_server(
     {
         // A pinned server is never skipped: there is nothing else to fall back to, and the operator
         // gets to see it keep trying rather than have the device quietly give up on their choice.
-        return DiscoveredServer::from_base_url(url);
+        return vec![DiscoveredServer::from_base_url(url)];
     }
 
     loop {
@@ -266,9 +270,11 @@ async fn resolve_server(
                     })
                     .cloned()
                     .collect();
-                if let Some(server) = fresh.into_iter().next() {
-                    info!("discovered {} at {}", server.instance_name, server.base_url);
-                    return server;
+                if !fresh.is_empty() {
+                    for server in &fresh {
+                        info!("discovered {} at {}", server.instance_name, server.base_url);
+                    }
+                    return fresh;
                 }
                 if !servers.is_empty() {
                     warn!(
@@ -284,6 +290,89 @@ async fn resolve_server(
             Err(err) => warn!("discovery task failed: {}", err),
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// Introduce this device to every server it can see, and return the one that has it.
+///
+/// The whole point of announcing to all of them: with one core in the house nothing changes -- it
+/// takes the device on and answers with its settings. With two, both show it as waiting until a
+/// person picks one, and only then does this device have a server. Whoever was not picked is told
+/// so on the spot, so the speaker disappears from their screen instead of sitting there offline
+/// forever.
+///
+/// `None` means nobody has it yet, which is a normal state and not a failure.
+async fn announce(
+    candidates: &[DiscoveredServer],
+    request: &ClientRegisterRequest,
+    declined: &mut HashMap<String, Instant>,
+    config: &config::Config,
+) -> Option<(DiscoveredServer, ServerApi, DesiredConfig)> {
+    let mut claimed: Vec<(DiscoveredServer, ServerApi, DesiredConfig)> = Vec::new();
+    let mut others: Vec<ServerApi> = Vec::new();
+
+    for server in candidates {
+        let Ok(api) = ServerApi::new(&server.base_url, &server.register_path, &server.status_path)
+        else {
+            continue;
+        };
+        match register(&api, request).await {
+            Registration::Accepted(desired) if desired.claimed => {
+                claimed.push((server.clone(), api, *desired));
+            }
+            Registration::Accepted(_) => {
+                info!(
+                    "{} can see this device and is waiting for someone to claim it",
+                    server.instance_name
+                );
+                others.push(api);
+            }
+            Registration::NotSupported => {
+                declined.insert(api.base_url().to_string(), Instant::now());
+                // A pinned server is not skipped and discovery is not run, so nothing else would
+                // slow this loop down. Wait before asking the same server the same question.
+                if is_pinned(config) {
+                    tokio::time::sleep(DISCOVERY_BACKOFF).await;
+                }
+            }
+            Registration::Unreachable => {}
+        }
+    }
+
+    if claimed.len() > 1 {
+        // Only an installation from before any of this: two servers that both still have the device
+        // written down. The one that has heard from it most recently wins, and the other is told.
+        warn!(
+            "{} servers say they have this device; taking the one that heard from it last",
+            claimed.len()
+        );
+        claimed.sort_by(|left, right| right.2.claimed_at.cmp(&left.2.claimed_at));
+    }
+
+    let chosen = claimed
+        .first()
+        .map(|(server, api, _)| (server.clone(), api.clone()))?;
+    for api in others
+        .into_iter()
+        .chain(claimed.iter().skip(1).map(|(_, api, _)| api.clone()))
+    {
+        say_goodbye(&api, request, chosen.1.base_url()).await;
+    }
+    claimed.into_iter().next()
+}
+
+/// Tell a server this device went to another one. One attempt: it is a courtesy, and the next
+/// announcement would say the same thing again anyway.
+async fn say_goodbye(api: &ServerApi, request: &ClientRegisterRequest, chosen: &str) {
+    let mut farewell = request.clone();
+    farewell.claimed_by = Some(chosen.to_string());
+    match api.register(&farewell).await {
+        Ok(_) => info!(
+            "told {} that this device went to {}",
+            api.base_url(),
+            chosen
+        ),
+        Err(err) => debug!("could not tell {}: {:#}", api.base_url(), err),
     }
 }
 
@@ -483,6 +572,9 @@ fn build_register_request(
             features: FEATURES.iter().map(|entry| entry.to_string()).collect(),
         },
         components: statuses.components(),
+        // Filled in by the caller, which is the one that knows what it found. See `announce`.
+        servers: Vec::new(),
+        claimed_by: None,
     }
 }
 
