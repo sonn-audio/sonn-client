@@ -26,9 +26,13 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-/// Devices the remote registers. All of them are grabbed: the volume keys and the button page are
+/// Devices a remote registers. All of them are grabbed: the volume keys and the button page are
 /// separate nodes, and which is which is not fixed.
-const REMOTE_NAME_PREFIX: &str = "BEORC";
+///
+/// Matched on the name the kernel gives them, which is the remote's own Bluetooth name -- so a
+/// Beoremote One appears as `BEORC…` and an Essence as `BeoSound Essence Keyboard`, under the name
+/// of the product it shipped with.
+const REMOTE_NAMES: [&str; 2] = ["BEORC", "BeoSound Essence"];
 /// How often to look for input devices that appeared or went away.
 const RESCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// `EV_KEY`, the only event type worth reading here.
@@ -158,7 +162,9 @@ fn remote_event_devices() -> Vec<PathBuf> {
         {
             continue;
         }
-        if device_name(&path).is_some_and(|name| name.starts_with(REMOTE_NAME_PREFIX)) {
+        if device_name(&path)
+            .is_some_and(|name| REMOTE_NAMES.iter().any(|prefix| name.starts_with(prefix)))
+        {
             found.push(path);
         }
     }
