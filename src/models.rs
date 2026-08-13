@@ -43,9 +43,8 @@ pub struct ClientCapabilities {
 /// A component this device manages on the server's behalf — software that is not part of the client
 /// binary but has to be present for a feature to work.
 ///
-/// Only one so far: `sonn-beoremote`, B&O's patched BlueZ 5.45, which is what makes a Beoremote
-/// One serve menus instead of acting like a keyboard. It is GPLv2 and it is a whole daemon, so it is
-/// fetched as its own artifact rather than linked into this binary.
+/// Only one so far: the client itself, which updates through the same mechanism it would install
+/// anything else with.
 #[derive(Debug, Clone, Serialize)]
 pub struct ComponentStatus {
     pub name: String,
@@ -122,8 +121,8 @@ pub struct ClientStatusRequest {
 /// user guessing from a silent menu.
 #[derive(Debug, Clone, Serialize)]
 pub struct BeoremoteStatusReport {
-    /// `disabled` | `waiting` | `connected` | `error` -- `waiting` means the patched bluetoothd is
-    /// not there (or not running), which is the usual reason a remote shows three dots.
+    /// `disabled` | `waiting` | `connected` | `error` -- `waiting` means the remote's service is not
+    /// registered with bluez yet, which is the usual reason a remote shows three dots.
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zone_id: Option<u32>,
@@ -221,7 +220,7 @@ pub struct DesiredConfig {
     /// Inputs this device should offer as Sendspin sources.
     #[serde(default)]
     pub sources: Vec<DesiredSource>,
-    /// Beoremote One support, when this device has the patched BlueZ and a remote paired to it.
+    /// Beoremote One support, for a device with a remote paired to it.
     #[serde(default)]
     pub beoremote: Option<DesiredBeoremote>,
     #[serde(default)]
@@ -366,9 +365,10 @@ impl DesiredConfig {
 
 /// Beoremote One support for this device.
 ///
-/// The remote talks to a patched `bluetoothd` (the `sonn-beoremote` component) over two unix
-/// sockets; this client fills the menus from the server and forwards what the user picks. The menu
-/// itself is entirely the server's: a new playlist appears on the remote with nothing deployed here.
+/// The client serves the remote's own GATT service on stock BlueZ and reads its keys from the
+/// kernel's input devices; the menus are filled from the server and what the user picks goes back
+/// up. The menu itself is entirely the server's: a new playlist appears on the remote with nothing
+/// deployed here.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DesiredBeoremote {
     #[serde(default)]
@@ -393,21 +393,17 @@ pub struct DesiredBeoremote {
     /// Volume points per key press, on the 0-100 scale.
     #[serde(default)]
     pub volume_step: Option<u8>,
-    /// Override the socket paths B&O's plugin uses. Defaults match their daemon.
-    #[serde(default)]
-    pub plugin_socket: Option<String>,
-    #[serde(default)]
-    pub hog_socket: Option<String>,
 }
 
 /// Software the server wants present on this device.
 ///
-/// Kept out of the client binary on purpose. `sonn-beoremote` is GPLv2 (B&O publish their
-/// BlueZ patches because they must), and linking a GPL daemon into this binary would relicense the
-/// lot. It is also dead weight on the devices that have no B&O remote.
+/// One so far: `sonn-client` itself. The shape is deliberately general -- a name, a version, a url
+/// and a hash -- because that is all installing anything needs, but a name this build does not know
+/// is refused rather than fetched.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct DesiredComponent {
-    /// Known name: `sonn-beoremote`. Anything else is refused rather than guessed at.
+    /// Known name: `sonn-client`, for a device updating itself. Anything else is refused rather
+    /// than guessed at.
     pub name: String,
     /// Version the server wants installed. A mismatch with what is here triggers a fetch.
     #[serde(default)]
@@ -415,7 +411,7 @@ pub struct DesiredComponent {
     /// Where to fetch the tarball.
     #[serde(default)]
     pub url: Option<String>,
-    /// Hex sha256 of the tarball. Required: this installs a daemon that owns the Bluetooth adapter.
+    /// Hex sha256 of the tarball. Required: this replaces software the device runs.
     #[serde(default)]
     pub sha256: Option<String>,
     /// False removes the component's service instead of installing it.

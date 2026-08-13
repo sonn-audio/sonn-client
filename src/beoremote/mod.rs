@@ -1,21 +1,12 @@
 //! Beoremote One support: menus on the remote, keys and picks back to the server.
 //!
-//! A Beoremote One paired to a stock Linux box is just a keyboard -- press MUSIC and the display
-//! shows three dots forever, because the list has to come from the host and stock BlueZ has no idea
-//! how to provide it. B&O's own BlueZ plugin does (they publish the patches under GPLv2 because they
-//! must), and it exposes two unix sockets for whoever wants to fill in the menus and take the keys.
-//! That "whoever" used to be a Python bridge next to the player; here it is part of the client, which
-//! removes the awkward part of the old setup: volume no longer has to travel over D-Bus to another
-//! process to reach the player, because the player is in this binary.
-//!
-//! ```text
-//! /var/run/beoremote_one_socket   menus, volume, selections   (plugin listens, we connect)
-//! /tmp/streamsdk_hog             raw 2-byte HID key reports   (we listen, hog connects)
-//! ```
-//!
-//! Order matters for the second one. B&O's patch 1016 makes bluetoothd suppress uHID for exactly
-//! these 2-byte reports *when the socket exists*; while it is absent, keys arrive as evdev events
-//! instead and this bridge never sees them. So the listener is created before anything else.
+//! A Beoremote One paired to a stock Linux box is only a keyboard -- press MUSIC and the display
+//! shows three dots forever, because the list has to come from the host and nothing on the host
+//! offers it. B&O solve that with a patched BlueZ carrying their own plugin; this client solves it
+//! by serving the remote's service itself ([`gatt`]) and reading its keys from the kernel's input
+//! devices ([`keys`]). No vendor daemon, no GPL artifact to install, and no unix sockets in the
+//! path -- and volume no longer travels to another process to reach the player, because the player
+//! is in this binary.
 //!
 //! What this module deliberately does *not* do is decide what a key means. Only the server knows
 //! what the zone is playing -- a source picked in the app never passes through here -- so keys go up
@@ -34,19 +25,15 @@ use crate::status::Registry;
 use crate::supervisor::{VolumeIntent, VolumeRequest};
 use anyhow::Result;
 use api::{BeoremoteApi, Menu, SelectOutcome};
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-pub const DEFAULT_PLUGIN_SOCKET: &str = "/var/run/beoremote_one_socket";
-pub const DEFAULT_HOG_SOCKET: &str = "/tmp/streamsdk_hog";
 const DEFAULT_MENU_POLL_MS: u64 = 10_000;
 const DEFAULT_VOLUME_STEP: u8 = 4;
-/// How long to wait before re-dialling the plugin socket. Absent usually means bluetoothd is not
-/// running, which is a normal state on a device whose B&O component was never installed.
+/// How long to wait before offering the remote's service to bluez again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
 
@@ -57,8 +44,6 @@ pub struct BeoremoteConfig {
     pub menu_poll: Duration,
     pub volume_player: Option<String>,
     pub volume_step: u8,
-    pub plugin_socket: PathBuf,
-    pub hog_socket: PathBuf,
 }
 
 impl BeoremoteConfig {
@@ -81,28 +66,12 @@ impl BeoremoteConfig {
             ),
             volume_player: desired.volume_player.clone(),
             volume_step: desired.volume_step.unwrap_or(DEFAULT_VOLUME_STEP).max(1),
-            plugin_socket: desired
-                .plugin_socket
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_PLUGIN_SOCKET)),
-            hog_socket: desired
-                .hog_socket
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from(DEFAULT_HOG_SOCKET)),
         })
     }
 
-    /// A change to any of this needs the bridge restarted; a menu poll interval does not.
+    /// A change to any of this needs the remote's service restarted; a menu poll interval does not.
     pub fn restart_key(&self) -> String {
-        format!(
-            "{}|{}|{}|{}",
-            self.zone_id,
-            self.api_base_url,
-            self.plugin_socket.display(),
-            self.hog_socket.display()
-        )
+        format!("{}|{}", self.zone_id, self.api_base_url)
     }
 }
 

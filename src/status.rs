@@ -197,8 +197,8 @@ impl Registry {
         self.bluetooth.lock().ok().and_then(|slot| slot.clone())
     }
 
-    /// Whether B&O's key socket has a peer. Its own setter because it changes on its own schedule --
-    /// bluetoothd connects when a remote does, which has nothing to do with the menu.
+    /// Whether a remote's keys are actually arriving. Its own setter because it changes on its own
+    /// schedule -- a remote connects when someone picks it up, which has nothing to do with the menu.
     pub fn set_beoremote_hid(&self, connected: bool) {
         if let Ok(mut slot) = self.beoremote.lock() {
             if let Some(report) = slot.as_mut() {

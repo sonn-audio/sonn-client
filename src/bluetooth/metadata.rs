@@ -7,8 +7,9 @@
 //! commands, so a phone behaves like any other source in the room.
 //!
 //! What a phone sends is entirely up to it. Title and artist are near-universal, album usually,
-//! duration often, artwork almost never over AVRCP -- so the player shows what there is and does not
-//! pretend the rest is missing data.
+//! duration and position often -- an iPhone sends both -- and artwork essentially never: AVRCP can
+//! carry cover art since 1.6, over a separate OBEX channel, and iOS does not offer it. So the room
+//! shows what there is, and a cover has to be found from the names rather than asked for.
 
 use anyhow::{Context, Result};
 use tracing::debug;
@@ -28,6 +29,9 @@ trait MediaPlayer {
     fn status(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn track(&self) -> zbus::Result<Properties>;
+    /// How far into the track the phone is, in milliseconds.
+    #[zbus(property)]
+    fn position(&self) -> zbus::Result<u32>;
 }
 
 /// What the phone says is playing.
@@ -38,6 +42,12 @@ pub struct NowPlaying {
     pub album: Option<String>,
     /// Track length in milliseconds, when the phone sends one.
     pub duration_ms: Option<u32>,
+    /// How far in the phone is, in milliseconds.
+    ///
+    /// Read on every poll rather than counted here: the room is not the one playing, and a phone
+    /// that is scrubbed, paused or skipped would leave any count of ours describing a different
+    /// moment than the one the listener is hearing.
+    pub position_ms: Option<u32>,
     /// `playing`, `paused` or `stopped`, as AVRCP spells it.
     pub status: Option<String>,
 }
@@ -86,6 +96,7 @@ pub async fn now_playing(connection: &Connection) -> Option<NowPlaying> {
 
     let mut playing = NowPlaying {
         status: player.status().await.ok(),
+        position_ms: player.position().await.ok(),
         ..Default::default()
     };
     if let Ok(track) = player.track().await {

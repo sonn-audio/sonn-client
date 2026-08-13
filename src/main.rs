@@ -58,7 +58,7 @@ const DECLINED_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Pause when every audioserver on the network has declined, so the search does not become a poll.
 const DISCOVERY_BACKOFF: Duration = Duration::from_secs(60);
 /// Named extras this build ships, so the server can offer the matching configuration.
-const FEATURES: [&str; 3] = ["source", "beoremote", "components"];
+const FEATURES: [&str; 3] = ["source", "beoremote", "bluetooth"];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,16 +85,6 @@ async fn main() -> Result<()> {
         Some("install") => install::run_install().await,
         Some("pair-remote") => run_pair_remote(argument, arguments.get(1).cloned()).await,
         Some("bluetooth") => run_bluetooth(argument, arguments.get(1).cloned()).await,
-        Some("components") => {
-            let status = components::inspect_bluetoothd();
-            println!(
-                "{}: {} ({})",
-                status.name,
-                status.state,
-                status.version.as_deref().unwrap_or("no version recorded")
-            );
-            Ok(())
-        }
         Some("run") | None => run().await,
         _ => {
             print_usage();
@@ -160,9 +150,6 @@ async fn run() -> Result<()> {
             warn!("could not enumerate audio inputs: {:#}", err);
             Vec::new()
         });
-        // Reported at registration so the server knows up front whether the B&O features can be
-        // offered on this device, without asking for an install to find out.
-        statuses.set_components(vec![components::inspect_bluetoothd()]);
         let request = build_register_request(&config, &identity, &outputs, &inputs, &statuses);
         let desired = match register(&api, &request).await {
             Registration::Accepted(desired) => *desired,
@@ -744,7 +731,6 @@ fn print_usage() {
     eprintln!("  sonn-client devices");
     eprintln!("  sonn-client pair-remote [address] [seconds]");
     eprintln!("  sonn-client bluetooth [name] [seconds]");
-    eprintln!("  sonn-client components");
     eprintln!("  sonn-client --help");
     eprintln!("  sonn-client --version");
     eprintln!();
@@ -875,7 +861,7 @@ mod tests {
 
     #[test]
     fn the_service_logs_and_the_one_shot_commands_do_not() {
-        // A device nobody is watching has to leave a trail; `devices` and `components` print their
+        // A device nobody is watching has to leave a trail; `devices` and `bluetooth` print their
         // answer and would only be cluttered by one.
         assert_eq!(default_log_filter(Some("run"), None), "sonn_client=info");
         assert_eq!(default_log_filter(None, None), "sonn_client=info");
