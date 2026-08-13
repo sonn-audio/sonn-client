@@ -42,6 +42,8 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 #[derive(Debug, Clone)]
 pub struct BeoremoteConfig {
     pub zone_id: u32,
+    /// Which remote models this room listens to. See [`keys::Models`].
+    pub models: keys::Models,
     pub api_base_url: String,
     pub menu_poll: Duration,
     pub volume_player: Option<String>,
@@ -54,8 +56,16 @@ impl BeoremoteConfig {
         fallback_base_url: &str,
     ) -> Option<Self> {
         let zone_id = desired.zone_id?;
+        let models = desired
+            .models
+            .as_ref()
+            .map_or_else(keys::Models::default, |models| keys::Models {
+                one: models.one.unwrap_or(true),
+                essence: models.essence.unwrap_or(true),
+            });
         Some(Self {
             zone_id,
+            models,
             api_base_url: desired
                 .api_base_url
                 .clone()
@@ -151,6 +161,7 @@ pub async fn run(
         config.volume_step,
         volume_tx.clone(),
         statuses.clone(),
+        config.models,
     ));
 
     loop {

@@ -426,6 +426,16 @@ impl DesiredConfig {
 /// up. The menu itself is entirely the server's: a new playlist appears on the remote with nothing
 /// deployed here.
 #[derive(Debug, Clone, Default, Deserialize)]
+/// Which remote models a room listens to. Absent fields mean "yes", so a server that names only the
+/// one it wants switched off says exactly that.
+pub struct DesiredRemoteModels {
+    #[serde(default)]
+    pub one: Option<bool>,
+    #[serde(default)]
+    pub essence: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct DesiredBeoremote {
     #[serde(default)]
     pub enabled: Option<bool>,
@@ -442,6 +452,10 @@ pub struct DesiredBeoremote {
     /// changed costs one request and disturbs the remote not at all.
     #[serde(default)]
     pub menu_poll_ms: Option<u64>,
+    /// Which remote models this room listens to. Absent means all of them, which is what a room
+    /// configured before this existed has been doing.
+    #[serde(default)]
+    pub models: Option<DesiredRemoteModels>,
     /// Sendspin `client_id` of the player whose volume the remote's volume keys move. Absent means
     /// the first player on this device.
     #[serde(default)]

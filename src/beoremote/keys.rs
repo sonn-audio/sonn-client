@@ -31,8 +31,8 @@ use tracing::{debug, info, warn};
 ///
 /// Matched on the name the kernel gives them, which is the remote's own Bluetooth name -- so a
 /// Beoremote One appears as `BEORC…` and an Essence as `BeoSound Essence Keyboard`, under the name
-/// of the product it shipped with.
-const REMOTE_NAMES: [&str; 2] = ["BEORC", "BeoSound Essence"];
+/// of the product it shipped with. The rule lives in `pairing::remote_kind`, once, because the same
+/// two names decide which model a paired remote is.
 /// How often to look for input devices that appeared or went away.
 ///
 /// Twice a second, because a remote's whole visit can be shorter than that. An Essence wakes on a
@@ -52,8 +52,43 @@ const KEY_VOLUME_DOWN: u16 = 114;
 
 /// What a reader thread reports: a press, or that its device is gone.
 enum Event {
-    Key(u16),
+    Key {
+        code: u16,
+        /// Which model sent it, so a room that listens to one and not the other can tell.
+        model: &'static str,
+    },
     Closed(PathBuf),
+}
+
+/// The models a room listens to.
+///
+/// A filter and not a switch: one bridge serves the room and hears every remote paired to its
+/// speaker, so a model that is off has its keys read and dropped. Read and dropped, not left alone
+/// -- the device is still grabbed, because a Beoremote One's standby key is `KEY_POWER` and an
+/// ungrabbed one reaches logind, which switches the machine off.
+#[derive(Debug, Clone, Copy)]
+pub struct Models {
+    pub one: bool,
+    pub essence: bool,
+}
+
+impl Default for Models {
+    fn default() -> Self {
+        // Everything, which is what a room configured before this existed has been doing.
+        Self {
+            one: true,
+            essence: true,
+        }
+    }
+}
+
+impl Models {
+    fn accepts(&self, model: &str) -> bool {
+        match model {
+            crate::pairing::KIND_ESSENCE => self.essence,
+            _ => self.one,
+        }
+    }
 }
 
 /// One `struct input_event`: a timeval, then type, code and value.
@@ -77,6 +112,7 @@ pub async fn run(
     volume_step: u8,
     volume_tx: mpsc::Sender<VolumeRequest>,
     statuses: Registry,
+    models: Models,
 ) {
     let api = BeoremoteApi::new(&api_base_url, zone_id).ok();
     let (keys_tx, mut keys) = mpsc::channel::<Event>(64);
@@ -86,11 +122,11 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = rescan.tick() => {
-                for path in remote_event_devices() {
+                for (path, model) in remote_event_devices() {
                     if open.contains(&path) {
                         continue;
                     }
-                    match spawn_reader(path.clone(), keys_tx.clone()) {
+                    match spawn_reader(path.clone(), model, keys_tx.clone()) {
                         Ok(()) => {
                             info!("beoremote reading keys from {}", path.display());
                             open.insert(path);
@@ -105,7 +141,11 @@ pub async fn run(
             event = keys.recv() => {
                 match event {
                     None => return,
-                    Some(Event::Key(code)) => {
+                    Some(Event::Key { code, model }) => {
+                        if !models.accepts(model) {
+                            debug!("beoremote key {code} ignored: this room does not use the {model}");
+                            continue;
+                        }
                         handle(code, &api, &volume_player, volume_step, &volume_tx).await;
                     }
                     // Re-pairing the remote destroys its input devices and the kernel makes new ones
@@ -153,8 +193,8 @@ async fn handle(
     }
 }
 
-/// Every `/dev/input/event*` that belongs to the remote.
-fn remote_event_devices() -> Vec<PathBuf> {
+/// Every `/dev/input/event*` that belongs to a remote, with the model it belongs to.
+fn remote_event_devices() -> Vec<(PathBuf, &'static str)> {
     let mut found = Vec::new();
     let Ok(entries) = std::fs::read_dir("/dev/input") else {
         return found;
@@ -168,10 +208,11 @@ fn remote_event_devices() -> Vec<PathBuf> {
         {
             continue;
         }
-        if device_name(&path)
-            .is_some_and(|name| REMOTE_NAMES.iter().any(|prefix| name.starts_with(prefix)))
+        if let Some(model) = device_name(&path)
+            .as_deref()
+            .and_then(crate::pairing::remote_kind)
         {
-            found.push(path);
+            found.push((path, model));
         }
     }
     found.sort();
@@ -199,7 +240,7 @@ fn device_name(path: &Path) -> Option<String> {
 ///
 /// A thread rather than an async reader: these are blocking character devices, they are idle almost
 /// all the time, and there are three of them.
-fn spawn_reader(path: PathBuf, keys: mpsc::Sender<Event>) -> Result<()> {
+fn spawn_reader(path: PathBuf, model: &'static str, keys: mpsc::Sender<Event>) -> Result<()> {
     let mut file = File::open(&path).with_context(|| format!("open {}", path.display()))?;
     grab(&file).with_context(|| format!("grab {}", path.display()))?;
 
@@ -222,7 +263,13 @@ fn spawn_reader(path: PathBuf, keys: mpsc::Sender<Event>) -> Result<()> {
                 if event.kind != EV_KEY || event.value != KEY_PRESS {
                     continue;
                 }
-                if keys.blocking_send(Event::Key(event.code)).is_err() {
+                if keys
+                    .blocking_send(Event::Key {
+                        code: event.code,
+                        model,
+                    })
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -250,6 +297,29 @@ fn grab(file: &File) -> Result<()> {
 
 extern "C" {
     fn ioctl(fd: i32, request: u64, arg: *mut u8) -> i32;
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::Models;
+    use crate::pairing::{KIND_ESSENCE, KIND_ONE};
+
+    #[test]
+    fn a_room_that_says_nothing_listens_to_every_model() {
+        let models = Models::default();
+        assert!(models.accepts(KIND_ONE));
+        assert!(models.accepts(KIND_ESSENCE));
+    }
+
+    #[test]
+    fn a_model_switched_off_is_not_listened_to() {
+        let models = Models {
+            one: true,
+            essence: false,
+        };
+        assert!(models.accepts(KIND_ONE));
+        assert!(!models.accepts(KIND_ESSENCE));
+    }
 }
 
 #[cfg(test)]

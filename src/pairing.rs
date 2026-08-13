@@ -555,9 +555,12 @@ fn is_remote_name(name: &str) -> bool {
 
 /// Which model advertises under this name, if it is a remote at all.
 pub fn remote_kind(name: &str) -> Option<&'static str> {
+    // Both by prefix, because the same rule has to answer for two kinds of name: what the remote
+    // advertises over Bluetooth (`BEORC1234`, `BeoSound Essence`) and what the kernel calls the
+    // input devices it builds from it (`BEORC Consumer Control`, `BeoSound Essence Keyboard`).
     if name.starts_with(REMOTE_NAME_PREFIX) {
         Some(KIND_ONE)
-    } else if name == ESSENCE_NAME {
+    } else if name.starts_with(ESSENCE_NAME) {
         Some(KIND_ESSENCE)
     } else {
         None
