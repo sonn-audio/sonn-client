@@ -27,6 +27,7 @@ use crate::models::{PairedRemote, PairingStatusReport};
 use crate::status::Registry;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::time::{sleep, timeout};
 use tracing::{debug, info, warn};
@@ -160,14 +161,37 @@ impl Agent {
     }
 }
 
+/// Whether a pairing window is open. See [`pair_remote`].
+static PAIRING: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`PAIRING`] however the window ends, including a panic.
+struct WindowGuard;
+
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        PAIRING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Open a pairing window and report what happened.
 ///
 /// `address` pairs one specific device; without it, the first `BEORC*` device that turns up wins.
+///
+/// One window at a time, and a second ask is dropped rather than queued. There is one radio, and a
+/// window that starts while another is running does real damage: it forgets the bond the first one
+/// has just made and then races it for the same device, which is how a remote ends up unpaired
+/// after someone pressed the button twice. The running window keeps the status it is reporting --
+/// overwriting it with "scanning" for a window that never opened would be a lie the screen shows.
 pub async fn pair_remote(
     statuses: &Registry,
     address: Option<String>,
     window: Option<Duration>,
 ) -> Result<()> {
+    if PAIRING.swap(true, Ordering::SeqCst) {
+        info!("a pairing window is already open; ignoring this one");
+        return Ok(());
+    }
+    let _guard = WindowGuard;
     let window = window.unwrap_or(DEFAULT_WINDOW);
     statuses.set_pairing(Some(PairingStatusReport {
         state: "scanning".to_string(),
