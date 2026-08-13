@@ -248,17 +248,6 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         .await
         .context("talk to the adapter")?;
 
-    // Whatever this adapter thinks it knows about the remote goes first -- but only a real bond.
-    //
-    // A bond has two halves, and only one of them is here. Clearing it on the remote -- which is
-    // what someone does when pairing stopped working -- leaves this side convinced the two are
-    // still paired, so pairing opens a link the remote refuses. Pressing pair means "start over".
-    //
-    // A device that is merely *listed* is not a bond, it is the discovery cache, and it is worth
-    // keeping: the name only appears in a scan response, so between advertising bursts that cache
-    // entry is the only place `BEORC` is written down. Removing it cost an entire window once.
-    forget_existing_bonds(&connection, &adapter, address.as_deref()).await;
-
     // LE only. Without the filter bluez discovers dual-mode, files a remote that is LE-only as a
     // BR/EDR device, and then pairs by *paging* it -- which it never answers: "Page Timeout".
     if let Err(err) = adapter
@@ -268,11 +257,7 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         debug!("could not ask for an LE-only scan: {err}");
     }
     adapter.start_discovery().await.context("start scanning")?;
-    info!(
-        "scanning up to {}s for a {}* remote",
-        window.as_secs(),
-        REMOTE_NAME_PREFIX
-    );
+    info!("scanning up to {}s for a remote", window.as_secs());
 
     let found = match timeout(window, watch_for_remote(&connection, address.as_deref())).await {
         Ok(found) => found?,
@@ -286,6 +271,24 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
         found.address,
         found.name.as_deref().unwrap_or("no name")
     );
+
+    // Whatever this adapter thinks it knows about *this* remote goes first -- but only a real bond,
+    // and only this one's.
+    //
+    // A bond has two halves and only one of them is here. Clearing it on the remote -- which is what
+    // someone does when pairing stopped working -- leaves this side convinced the two are still
+    // paired, so pairing opens a link the remote refuses. Pressing pair means "start over" for the
+    // remote in your hand.
+    //
+    // It emphatically does not mean "start over" for the others. Dropping every bond when a window
+    // opens is what this did once, and pairing a second remote then silently unpaired the first: a
+    // room can have a Beoremote One on the table and an Essence in the kitchen, and neither is a
+    // draft of the other.
+    //
+    // A device that is merely *listed* is not a bond, it is the discovery cache, and it is worth
+    // keeping: the name only appears in a scan response, so between advertising bursts that cache
+    // entry is the only place the name is written down. Removing it cost an entire window once.
+    forget_existing_bonds(&connection, &adapter, Some(&found.address)).await;
 
     // Stop scanning before connecting. An adapter that is still sweeping channels is a slower and
     // less reliable one to establish a link with, and BlueZ would suspend the discovery anyway.
