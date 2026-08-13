@@ -330,7 +330,10 @@ async fn hold_until_the_remote_is_done(device: &DeviceProxy<'_>, address: &str) 
         }
         match device.connected().await {
             Ok(false) => {
-                debug!("{address} disconnected on its own after {:?}; done", start.elapsed());
+                debug!(
+                    "{address} disconnected on its own after {:?}; done",
+                    start.elapsed()
+                );
                 return;
             }
             Ok(true) => {}
@@ -372,10 +375,7 @@ async fn pair_with_retries(device: &DeviceProxy<'_>, address: &str) -> Result<()
 }
 
 /// Keep polling what BlueZ has discovered until a remote is on the air.
-async fn watch_for_remote(
-    connection: &Connection,
-    target: Option<&str>,
-) -> Result<Candidate> {
+async fn watch_for_remote(connection: &Connection, target: Option<&str>) -> Result<Candidate> {
     loop {
         for (path, interfaces) in managed_objects(connection).await?.into_iter() {
             let Some(properties) = interface(&interfaces, "org.bluez.Device1") else {
@@ -470,7 +470,10 @@ type ManagedObjects = HashMap<OwnedObjectPath, HashMap<OwnedInterfaceName, Prope
 type Properties = HashMap<String, OwnedValue>;
 
 /// Interface names are their own type on the bus, so a plain `get("org.bluez.Device1")` will not do.
-fn interface<'a>(interfaces: &'a HashMap<OwnedInterfaceName, Properties>, name: &str) -> Option<&'a Properties> {
+fn interface<'a>(
+    interfaces: &'a HashMap<OwnedInterfaceName, Properties>,
+    name: &str,
+) -> Option<&'a Properties> {
     interfaces
         .iter()
         .find(|(interface, _)| interface.as_str() == name)
@@ -618,7 +621,10 @@ mod tests {
 
         // Unless it is the one that was asked for by address, which is the manual override.
         let found = candidate_from(&path(), &essence, Some("64:cf:d9:1b:aa:fc"));
-        assert_eq!(found.expect("the named device").address, "64:CF:D9:1B:AA:FC");
+        assert_eq!(
+            found.expect("the named device").address,
+            "64:CF:D9:1B:AA:FC"
+        );
     }
 
     #[test]

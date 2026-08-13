@@ -158,7 +158,10 @@ impl BluetoothConfig {
             // spellings agree because both are this device's id with the same suffix.
             // 48 kHz unless the server says otherwise: it is what every output here runs at, and a
             // phone that sends it already is then carried untouched.
-            sample_rate: desired.sample_rate.filter(|rate| *rate > 0).unwrap_or(48_000),
+            sample_rate: desired
+                .sample_rate
+                .filter(|rate| *rate > 0)
+                .unwrap_or(48_000),
             client_id: desired
                 .client_id
                 .as_deref()
@@ -270,10 +273,7 @@ impl Agent {
     fn request_confirmation(&self, device: OwnedObjectPath, passkey: u32) {
         // Nothing to compare it against on this end; the phone shows the same number and its user
         // is the one who decides.
-        info!(
-            "bluetooth: confirming {passkey:06} for {}",
-            device.as_str()
-        );
+        info!("bluetooth: confirming {passkey:06} for {}", device.as_str());
     }
 
     fn request_authorization(&self, device: OwnedObjectPath) {
@@ -523,7 +523,7 @@ async fn follow_volume(
         return;
     }
     *last = Some(volume);
-    let scaled = ((u32::from(volume) * 100 + 126) / 127).min(100) as u8;
+    let scaled = (u32::from(volume) * 100).div_ceil(127).min(100) as u8;
     info!("bluetooth: the phone set the volume to {scaled}");
     let _ = volume_tx
         .send(crate::supervisor::VolumeRequest {
@@ -755,9 +755,11 @@ async fn inspect(
         Err(err) => report.last_error = Some(format!("{err:#}")),
     }
     // Connected first, then by name, so the phone someone is holding is at the top.
-    report
-        .devices
-        .sort_by(|a, b| b.connected.cmp(&a.connected).then_with(|| a.name.cmp(&b.name)));
+    report.devices.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     report.now_playing = metadata::now_playing(connection).await;
     report
 }
@@ -871,7 +873,10 @@ async fn reconnect_audio(connection: &Connection, path: &OwnedObjectPath) {
     match device.connect_profile(A2DP_SOURCE_UUID).await {
         Ok(()) => info!("bluetooth: asked {} for its audio again", path.as_str()),
         Err(err) => {
-            debug!("bluetooth: {} would not reconnect audio: {err}", path.as_str());
+            debug!(
+                "bluetooth: {} would not reconnect audio: {err}",
+                path.as_str()
+            );
             // Some phones will not answer a profile request but will take the whole device.
             if let Err(err) = device.connect().await {
                 debug!("bluetooth: {} would not connect: {err}", path.as_str());
@@ -1043,7 +1048,9 @@ mod tests {
             "0000180f-0000-1000-8000-00805f9b34fb",
         ])));
         // A speaker offers a Sink, not a Source: it cannot play to us either.
-        assert!(!offers_audio(&uuids(&["0000110b-0000-1000-8000-00805f9b34fb"])));
+        assert!(!offers_audio(&uuids(&[
+            "0000110b-0000-1000-8000-00805f9b34fb"
+        ])));
         assert!(!offers_audio(&Properties::new()));
     }
 

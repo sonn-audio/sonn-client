@@ -57,7 +57,8 @@ async fn main() {
         println!("selftest: audio finished; closing the source");
     });
 
-    let mut config = sendspin::source::SourceConfig::new(client_id, "Bluetooth selftest".to_string());
+    let mut config =
+        sendspin::source::SourceConfig::new(client_id, "Bluetooth selftest".to_string());
     config.codec = "pcm".to_string();
     config.sample_rate = sample_rate;
     config.channels = channels as u8;

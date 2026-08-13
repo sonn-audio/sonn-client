@@ -133,7 +133,10 @@ pub fn read_stream(
                             }
                         }
                     }
-                    None => warn!("bluetooth: a packet of {} bytes carried no audio", packet.len()),
+                    None => warn!(
+                        "bluetooth: a packet of {} bytes carried no audio",
+                        packet.len()
+                    ),
                 }
             }
         }
@@ -174,7 +177,10 @@ unsafe fn libc_recv(fd: i32, buf: *mut u8, len: usize) -> isize {
 /// A phone that stops playing leaves the transport in place and moves it to `idle`. Watching only
 /// for the transport to disappear therefore misses the most ordinary event there is -- someone
 /// pressing pause -- and leaves the room holding a source that will never carry another sample.
-pub async fn state(connection: &zbus::Connection, path: &zbus::zvariant::OwnedObjectPath) -> String {
+pub async fn state(
+    connection: &zbus::Connection,
+    path: &zbus::zvariant::OwnedObjectPath,
+) -> String {
     let Ok(builder) = super::endpoint::MediaTransportProxy::builder(connection).path(path.clone())
     else {
         return String::new();
@@ -247,7 +253,7 @@ mod tests {
     #[test]
     fn anything_too_short_to_be_audio_is_not_audio() {
         assert!(payload(&[]).is_none());
-        assert!(payload(&vec![0u8; RTP_HEADER]).is_none());
+        assert!(payload(&[0u8; RTP_HEADER]).is_none());
         // A header and a frame count, but nothing behind it.
         assert!(payload(&packet(0x80, &[0x01])).is_none());
         // An extension that claims more than the packet holds.

@@ -83,7 +83,8 @@ pub fn build(desired: &DesiredSource, name: String) -> Result<Source> {
         .map(str::trim)
         .filter(|id| !id.is_empty())
     {
-        let found = find_input_device(id).map_err(|err| anyhow!("capture device {}: {}", id, err))?;
+        let found =
+            find_input_device(id).map_err(|err| anyhow!("capture device {}: {}", id, err))?;
         device = Some(found.clone());
         config.device = Some(found);
     }
@@ -168,8 +169,11 @@ fn best_input_format(device: &cpal::Device) -> InputFormat {
             config.max_sample_rate()
         };
         let candidate_channels = u8::try_from(config.channels()).unwrap_or(DEFAULT_CHANNELS);
-        if (candidate, candidate_channels.min(DEFAULT_CHANNELS), candidate_rate)
-            > (depth, channels.min(DEFAULT_CHANNELS), rate)
+        if (
+            candidate,
+            candidate_channels.min(DEFAULT_CHANNELS),
+            candidate_rate,
+        ) > (depth, channels.min(DEFAULT_CHANNELS), rate)
         {
             depth = candidate;
             channels = candidate_channels;
@@ -177,7 +181,7 @@ fn best_input_format(device: &cpal::Device) -> InputFormat {
             best = InputFormat {
                 sample_rate: candidate_rate,
                 bit_depth: candidate,
-                channels: candidate_channels.min(DEFAULT_CHANNELS).max(1),
+                channels: candidate_channels.clamp(1, DEFAULT_CHANNELS),
             };
         }
     }

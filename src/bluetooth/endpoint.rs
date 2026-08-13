@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, info};
-use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
+use zbus::zvariant::{ObjectPath, OwnedObjectPath};
 use zbus::{interface, proxy, Connection};
 
 /// Where our endpoint lives on the bus.
@@ -243,7 +243,7 @@ impl A2dpEndpoint {
             )
             .await
             .ok()?;
-        String::try_from(OwnedValue::from(value)).ok()
+        String::try_from(value).ok()
     }
 
     /// What the stream is, for whoever has to turn it into audio.
@@ -268,7 +268,10 @@ impl Drop for A2dpEndpoint {
             {
                 let _ = media.unregister_endpoint(&path).await;
             }
-            let _ = connection.object_server().remove::<Endpoint, _>(&path).await;
+            let _ = connection
+                .object_server()
+                .remove::<Endpoint, _>(&path)
+                .await;
         });
     }
 }
@@ -318,7 +321,12 @@ fn select(capabilities: &[u8]) -> Option<[u8; 4]> {
     if max < min {
         return None;
     }
-    Some([frequency | channels, blocks | subbands | allocation, min, max])
+    Some([
+        frequency | channels,
+        blocks | subbands | allocation,
+        min,
+        max,
+    ])
 }
 
 /// The best option a phone offers within one field: its lowest set bit.
@@ -381,7 +389,10 @@ mod tests {
         assert_eq!(select(&phone()).expect("a configuration")[3], 53);
         // One that allows more gets our ceiling, which is what SBC-XQ is.
         let generous = [0x3F, 0xFF, 2, 250];
-        assert_eq!(select(&generous).expect("a configuration")[3], sbc::BITPOOL_MAX);
+        assert_eq!(
+            select(&generous).expect("a configuration")[3],
+            sbc::BITPOOL_MAX
+        );
     }
 
     #[test]

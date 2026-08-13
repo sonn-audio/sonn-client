@@ -489,12 +489,9 @@ fn reconcile_bluetooth(
     ctx: &SupervisorContext,
     volume_tx: &mpsc::Sender<VolumeRequest>,
 ) {
-    let wanted = desired
-        .bluetooth
-        .as_ref()
-        .and_then(|entry| {
-            BluetoothConfig::from_desired(entry, sendspin_url(desired), &ctx.device_id)
-        });
+    let wanted = desired.bluetooth.as_ref().and_then(|entry| {
+        BluetoothConfig::from_desired(entry, sendspin_url(desired), &ctx.device_id)
+    });
 
     match (&wanted, running.as_ref()) {
         (Some(config), Some(entry)) if entry.key == config.restart_key() => return,

@@ -176,7 +176,10 @@ fn device_name(path: &Path) -> Option<String> {
     if read <= 0 {
         return None;
     }
-    let end = usize::try_from(read).ok()?.saturating_sub(1).min(buffer.len());
+    let end = usize::try_from(read)
+        .ok()?
+        .saturating_sub(1)
+        .min(buffer.len());
     Some(String::from_utf8_lossy(&buffer[..end]).trim().to_string())
 }
 
@@ -202,7 +205,8 @@ fn spawn_reader(path: PathBuf, keys: mpsc::Sender<Event>) -> Result<()> {
                 }
             };
             for chunk in buffer[..read].chunks_exact(EVENT_SIZE) {
-                let event: libc_input_event = unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
+                let event: libc_input_event =
+                    unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
                 if event.kind != EV_KEY || event.value != KEY_PRESS {
                     continue;
                 }
@@ -225,7 +229,7 @@ fn spawn_reader(path: PathBuf, keys: mpsc::Sender<Event>) -> Result<()> {
 fn grab(file: &File) -> Result<()> {
     // EVIOCGRAB: _IOW('E', 0x90, int)
     let request = 0x4000_0000u64 | (4 << 16) | (u64::from(b'E') << 8) | 0x90;
-    let result = unsafe { ioctl(file.as_raw_fd(), request, 1u64 as *mut u8) };
+    let result = unsafe { ioctl(file.as_raw_fd(), request, std::ptr::dangling_mut::<u8>()) };
     if result < 0 {
         anyhow::bail!("EVIOCGRAB refused (is another process holding this device?)");
     }

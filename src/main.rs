@@ -531,7 +531,10 @@ async fn run_source_command(
         };
         info!("bluetooth: {} on the phone", command.command);
         if !bluetooth.send(bluetooth::Command::Control(control)) {
-            warn!("bluetooth: {} went nowhere; the radio is not running", command.command);
+            warn!(
+                "bluetooth: {} went nowhere; the radio is not running",
+                command.command
+            );
         }
         return;
     }

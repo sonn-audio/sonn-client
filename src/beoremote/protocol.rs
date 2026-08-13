@@ -138,6 +138,4 @@ mod tests {
         let encoded = encode_sources(&[("Rock, Paper".to_string(), false)]);
         assert_eq!(String::from_utf8(encoded).unwrap(), "Rock  Paper,0");
     }
-
-
 }

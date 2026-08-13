@@ -36,7 +36,6 @@ const DEFAULT_VOLUME_STEP: u8 = 4;
 /// How long to wait before offering the remote's service to bluez again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-
 #[derive(Debug, Clone)]
 pub struct BeoremoteConfig {
     pub zone_id: u32,
@@ -74,7 +73,6 @@ impl BeoremoteConfig {
         format!("{}|{}", self.zone_id, self.api_base_url)
     }
 }
-
 
 /// Run the bridge until told to stop. Returns only on shutdown; connection loss is retried inside.
 pub async fn run(
