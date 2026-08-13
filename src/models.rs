@@ -113,6 +113,9 @@ pub struct ClientStatusRequest {
     pub pairing: Option<PairingStatusReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub beoremote: Option<BeoremoteStatusReport>,
+    /// What the radio is doing: visible or not, which phones are paired, what is playing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bluetooth: Option<crate::bluetooth::BluetoothStatus>,
 }
 
 /// How the Beoremote One bridge is doing, so the server can say "remote connected" instead of the
@@ -221,6 +224,8 @@ pub struct DesiredConfig {
     /// Beoremote One support, when this device has the patched BlueZ and a remote paired to it.
     #[serde(default)]
     pub beoremote: Option<DesiredBeoremote>,
+    #[serde(default)]
+    pub bluetooth: Option<DesiredBluetooth>,
     /// Managed software the server wants installed here.
     #[serde(default)]
     pub components: Vec<DesiredComponent>,
@@ -296,6 +301,33 @@ pub struct DesiredSource {
     /// selects a source only once it reports audio.
     #[serde(default)]
     pub always_on: Option<bool>,
+}
+
+/// Bluetooth audio into a zone: a phone pairs with this device and plays to the room.
+///
+/// The audio does not travel any further than this binary before it becomes an ordinary source: A2DP
+/// is terminated here and streamed to the server the same way a line input is, so the server needs
+/// no receiver and no codec. What comes down is a switch, the name a phone should see, how long to
+/// stay visible when someone asks, and whether the phone may drive the room (AVRCP).
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DesiredBluetooth {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Zone this audio belongs to. Required to do anything.
+    #[serde(default)]
+    pub zone_id: Option<u32>,
+    /// What a phone sees in its list. The room's name, not the box's.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// How long to stay visible after someone opens the pairing window.
+    #[serde(default)]
+    pub discoverable_seconds: Option<u32>,
+    /// A fixed passkey for phones that ask for one; most pair with a confirmation instead.
+    #[serde(default)]
+    pub pin: Option<String>,
+    /// Whether the phone's transport keys and its metadata are welcome.
+    #[serde(default)]
+    pub control: Option<bool>,
 }
 
 /// Beoremote One support for this device.

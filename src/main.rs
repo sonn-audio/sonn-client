@@ -9,6 +9,7 @@
 
 mod alsa_quiet;
 mod beoremote;
+mod bluetooth;
 mod components;
 mod config;
 mod devices;
@@ -83,6 +84,7 @@ async fn main() -> Result<()> {
         Some("devices") => devices::print_devices(),
         Some("install") => install::run_install().await,
         Some("pair-remote") => run_pair_remote(argument, arguments.get(1).cloned()).await,
+        Some("bluetooth") => run_bluetooth(argument, arguments.get(1).cloned()).await,
         Some("components") => {
             let status = components::inspect_bluetoothd();
             println!(
@@ -116,6 +118,8 @@ async fn run() -> Result<()> {
         config.on_command.clone(),
     ));
     let statuses = status::Registry::new();
+    // Shared with the supervisor, which fills it while a zone's Bluetooth is running.
+    let bluetooth_commands = bluetooth::CommandBus::default();
     health::spawn(statuses.clone());
     spawn_shutdown_handler(Arc::clone(&hooks));
     // Said out loud at startup, because the alternative is reading a log full of the wrong server and
@@ -192,6 +196,7 @@ async fn run() -> Result<()> {
             stop_tx,
             outputs,
             inputs,
+            bluetooth_commands.clone(),
         ));
 
         // Returns when the poller gives up on this server (or its sender is dropped), having first
@@ -202,6 +207,7 @@ async fn run() -> Result<()> {
                 statuses: statuses.clone(),
                 fallback_volume_hook: config.volume_hook.clone(),
                 server_base_url: api.base_url().to_string(),
+                bluetooth_commands: bluetooth_commands.clone(),
             },
             stop_rx,
         )
@@ -335,6 +341,7 @@ async fn status_loop(
     stop_tx: watch::Sender<bool>,
     initial_outputs: Vec<OutputDeviceInfo>,
     initial_inputs: Vec<OutputDeviceInfo>,
+    bluetooth_commands: bluetooth::CommandBus,
 ) {
     let mut reported_outputs = hash_outputs(&initial_outputs);
     let mut reported_inputs = hash_outputs(&initial_inputs);
@@ -361,6 +368,7 @@ async fn status_loop(
             components: statuses.components(),
             pairing: statuses.pairing(),
             beoremote: statuses.beoremote(),
+            bluetooth: statuses.bluetooth(),
         };
 
         match api.post_status(&device_id, &request).await {
@@ -372,7 +380,7 @@ async fn status_loop(
                 for command in &desired.commands {
                     // Built-ins first: a command this client can carry out itself should not need a
                     // script on the device to be useful.
-                    if handle_builtin_command(command, &statuses).await {
+                    if handle_builtin_command(command, &statuses, &bluetooth_commands).await {
                         continue;
                     }
                     hooks.command(&command.command, &command.args).await;
@@ -442,7 +450,11 @@ fn build_register_request(
 ///
 /// Returns true when it was one of ours. Pairing is the case that matters: it is the one thing a user
 /// would otherwise need a terminal for, and the server can offer it as a button instead.
-async fn handle_builtin_command(command: &DeviceCommand, statuses: &status::Registry) -> bool {
+async fn handle_builtin_command(
+    command: &DeviceCommand,
+    statuses: &status::Registry,
+    bluetooth_commands: &bluetooth::CommandBus,
+) -> bool {
     match command.command.as_str() {
         "pair_remote" => {
             let address = command.args.first().cloned();
@@ -454,6 +466,25 @@ async fn handle_builtin_command(command: &DeviceCommand, statuses: &status::Regi
                     warn!("pairing failed to start: {:#}", err);
                 }
             });
+            true
+        }
+        // Be findable for the window the zone configured. Nothing else opens it: a speaker that is
+        // permanently discoverable is one every passer-by can see.
+        "bluetooth_discoverable" => {
+            if !bluetooth_commands.send(bluetooth::Command::Discoverable) {
+                warn!("bluetooth is not set up for a zone on this device");
+            }
+            true
+        }
+        "bluetooth_forget" => {
+            match command.args.first() {
+                Some(address) => {
+                    if !bluetooth_commands.send(bluetooth::Command::Forget(address.clone())) {
+                        warn!("bluetooth is not set up for a zone on this device");
+                    }
+                }
+                None => warn!("bluetooth_forget needs the address of the phone to forget"),
+            }
             true
         }
         _ => false,
@@ -536,6 +567,89 @@ fn spawn_shutdown_handler(hooks: Arc<hooks::HookRunner>) {
     });
 }
 
+/// `sonn-client bluetooth [name] [seconds]`, for trying the radio without a server.
+///
+/// The same module the server drives, with a name and a window given by hand: the device becomes
+/// findable, a phone can pair, and what it plays and which phones are known is printed as it
+/// happens. It is the only way to see whether the radio side of a zone works without configuring one.
+async fn run_bluetooth(name: Option<String>, window: Option<String>) -> Result<()> {
+    let statuses = status::Registry::new();
+    let seconds = window
+        .as_deref()
+        .and_then(|seconds| seconds.parse::<u64>().ok())
+        .unwrap_or(180);
+    let config = bluetooth::BluetoothConfig {
+        zone_id: 0,
+        name: name.unwrap_or_else(|| "Sonn".to_string()),
+        discoverable: std::time::Duration::from_secs(seconds),
+        pin: None,
+        control: true,
+        api_base_url: String::new(),
+    };
+    println!(
+        "Findable as \"{}\" for {}s. Pair from a phone; ctrl-c to stop.",
+        config.name, seconds
+    );
+
+    let (commands, receiver) = tokio::sync::mpsc::channel(4);
+    let radio = tokio::spawn(bluetooth::run(config, statuses.clone(), receiver));
+    // Open the window straight away: a command line that has to be told twice is a worse tool.
+    let _ = commands.send(bluetooth::Command::Discoverable).await;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    let mut last = String::new();
+    while tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let Some(report) = statuses.bluetooth() else {
+            continue;
+        };
+        // Only when it changed: a screen that repeats itself hides the moment something happened.
+        let line = describe_bluetooth(&report);
+        if line != last {
+            println!("{line}");
+            last = line;
+        }
+    }
+    radio.abort();
+    Ok(())
+}
+
+fn describe_bluetooth(report: &bluetooth::BluetoothStatus) -> String {
+    let phones = if report.devices.is_empty() {
+        "no phones paired".to_string()
+    } else {
+        report
+            .devices
+            .iter()
+            .map(|phone| {
+                let state = match (phone.connected, phone.streaming) {
+                    (_, true) => "streaming",
+                    (true, false) => "connected",
+                    (false, false) => "paired",
+                };
+                format!("{} ({state})", phone.name)
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let playing = match &report.now_playing {
+        Some(track) => format!(
+            " -- {} / {}",
+            track.artist.as_deref().unwrap_or("?"),
+            track.title.as_deref().unwrap_or("?")
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{}: {phones}{playing}",
+        if report.discoverable {
+            "findable"
+        } else {
+            "not findable"
+        }
+    )
+}
+
 /// `sonn-client pair-remote [address] [seconds]`, for pairing a Beoremote One by hand. The same flow the server
 /// triggers with a `pair_remote` command, so the button in the UI and the command line cannot drift.
 async fn run_pair_remote(address: Option<String>, window: Option<String>) -> Result<()> {
@@ -577,6 +691,7 @@ fn print_usage() {
     eprintln!("  sonn-client install");
     eprintln!("  sonn-client devices");
     eprintln!("  sonn-client pair-remote [address] [seconds]");
+    eprintln!("  sonn-client bluetooth [name] [seconds]");
     eprintln!("  sonn-client components");
     eprintln!("  sonn-client --help");
     eprintln!("  sonn-client --version");

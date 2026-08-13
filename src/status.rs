@@ -95,6 +95,7 @@ pub struct Registry {
     components: Arc<Mutex<Vec<ComponentStatus>>>,
     pairing: Arc<Mutex<Option<PairingStatusReport>>>,
     beoremote: Arc<Mutex<Option<BeoremoteStatusReport>>>,
+    bluetooth: Arc<Mutex<Option<crate::bluetooth::BluetoothStatus>>>,
     started: Instant,
 }
 
@@ -106,6 +107,7 @@ impl Registry {
             components: Arc::new(Mutex::new(Vec::new())),
             pairing: Arc::new(Mutex::new(None)),
             beoremote: Arc::new(Mutex::new(None)),
+            bluetooth: Arc::new(Mutex::new(None)),
             started: Instant::now(),
         }
     }
@@ -183,6 +185,16 @@ impl Registry {
 
     pub fn beoremote(&self) -> Option<BeoremoteStatusReport> {
         self.beoremote.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    pub fn set_bluetooth(&self, report: Option<crate::bluetooth::BluetoothStatus>) {
+        if let Ok(mut slot) = self.bluetooth.lock() {
+            *slot = report;
+        }
+    }
+
+    pub fn bluetooth(&self) -> Option<crate::bluetooth::BluetoothStatus> {
+        self.bluetooth.lock().ok().and_then(|slot| slot.clone())
     }
 
     /// Whether B&O's key socket has a peer. Its own setter because it changes on its own schedule --

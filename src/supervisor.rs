@@ -12,6 +12,7 @@
 //! them is a channel.
 
 use crate::beoremote::{self, BeoremoteConfig};
+use crate::bluetooth::{self, BluetoothConfig};
 use crate::components;
 use crate::models::{DesiredConfig, DesiredPlayer, DesiredSource};
 use crate::player::{self, LiveSettings};
@@ -82,6 +83,10 @@ pub struct SupervisorContext {
     /// Base URL of the server we registered with, for the parts of the beoremote bridge that talk
     /// HTTP rather than Sendspin.
     pub server_base_url: String,
+    /// Where an operator's Bluetooth commands are handed in. Filled when the radio starts for a
+    /// zone and cleared when it stops, so a command sent while it is off says so instead of
+    /// disappearing.
+    pub bluetooth_commands: bluetooth::CommandBus,
 }
 
 pub async fn run(
@@ -92,6 +97,7 @@ pub async fn run(
     let mut players: HashMap<String, RunningPlayer> = HashMap::new();
     let mut sources: HashMap<String, RunningSource> = HashMap::new();
     let mut beoremote: Option<RunningBeoremote> = None;
+    let mut bluetooth: Option<RunningBluetooth> = None;
     let (volume_tx, mut volume_rx) = mpsc::channel::<VolumeRequest>(VOLUME_QUEUE);
     // Components are reconciled on change only: it writes files and restarts services, which is not
     // something to redo every five seconds.
@@ -106,6 +112,7 @@ pub async fn run(
         reconcile_players(&desired, &mut players, &ctx).await;
         reconcile_sources(&desired, &mut sources, &ctx).await;
         reconcile_beoremote(&desired, &mut beoremote, &ctx, &volume_tx);
+        reconcile_bluetooth(&desired, &mut bluetooth, &ctx);
 
         tokio::select! {
             changed = desired_rx.changed() => {
@@ -128,6 +135,7 @@ pub async fn run(
     }
 
     stop_beoremote(&mut beoremote);
+    stop_bluetooth(&mut bluetooth);
     stop_all_players(&mut players).await;
     stop_all_sources(&mut sources).await;
     ctx.statuses.retain(&[]);
@@ -435,6 +443,66 @@ async fn stop_source(entry: RunningSource) {
 async fn stop_all_sources(running: &mut HashMap<String, RunningSource>) {
     for (_, entry) in running.drain().collect::<Vec<_>>() {
         stop_source(entry).await;
+    }
+}
+
+// ---------------------------------------------------------------------------- bluetooth
+
+/// The radio, set up for whichever zone claimed it.
+struct RunningBluetooth {
+    key: String,
+    handle: tokio::task::JoinHandle<()>,
+    /// Where an operator's commands go: open the pairing window, forget a phone.
+    commands: mpsc::Sender<bluetooth::Command>,
+}
+
+fn reconcile_bluetooth(
+    desired: &DesiredConfig,
+    running: &mut Option<RunningBluetooth>,
+    ctx: &SupervisorContext,
+) {
+    let wanted = desired
+        .bluetooth
+        .as_ref()
+        .and_then(|entry| BluetoothConfig::from_desired(entry, &ctx.server_base_url));
+
+    match (&wanted, running.as_ref()) {
+        (Some(config), Some(entry)) if entry.key == config.restart_key() => return,
+        (None, None) => return,
+        _ => {}
+    }
+
+    stop_bluetooth(running);
+    ctx.statuses.set_bluetooth(None);
+    ctx.bluetooth_commands.set(None);
+
+    let Some(config) = wanted else {
+        return;
+    };
+    info!(
+        zone_id = config.zone_id,
+        name = %config.name,
+        "starting bluetooth audio"
+    );
+    let key = config.restart_key();
+    let statuses = ctx.statuses.clone();
+    // Room for a burst: an operator can press pair twice, and a phone can be forgotten while the
+    // window is open, without either being dropped.
+    let (commands, receiver) = mpsc::channel(8);
+    let handle = tokio::spawn(async move {
+        bluetooth::run(config, statuses, receiver).await;
+    });
+    ctx.bluetooth_commands.set(Some(commands.clone()));
+    *running = Some(RunningBluetooth {
+        key,
+        handle,
+        commands,
+    });
+}
+
+fn stop_bluetooth(running: &mut Option<RunningBluetooth>) {
+    if let Some(entry) = running.take() {
+        entry.handle.abort();
     }
 }
 
