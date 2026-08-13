@@ -122,16 +122,17 @@ pub fn spawn(
         let _ = stdin.shutdown().await;
     });
 
-    // PCM out, through a buffer that hands it on at a steady rate.
+    // PCM out, at the rate it arrives.
     //
-    // Bluetooth does not arrive evenly. A phone sends in bursts of a few dozen milliseconds, a
-    // retransmission or a busy moment on this board pushes a burst late, and the server -- which
-    // plays from a lead of a quarter to a third of a second -- has nothing to absorb that with.
-    // Measured against a phone: bursts averaging 39 ms with spikes past 350 ms, the lead walking
-    // into its floor, and the room hearing it.
+    // There is deliberately no pacing here, and that is worth saying because the obvious thing to
+    // reach for -- collect the bursts, release them on a timer -- was tried and was wrong. The
+    // phone's crystal is the clock for this audio. A twenty millisecond tick of our own runs a
+    // fraction of a percent faster or slower than that, and a fraction of a percent is a buffer
+    // emptied in half a minute: measured as twenty seconds of perfect sound followed by permanent
+    // starvation, with a byte rate that looked right the whole time.
     //
-    // So the audio is collected here and released on a clock. What goes out is smooth by
-    // construction; what the radio does stays behind this buffer.
+    // What smooths the bursts instead is the size of the reads above and the lead the server
+    // already plays behind. Neither invents a second clock.
     let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     tokio::spawn(async move {
         let mut buffer = vec![0u8; CHUNK_BYTES];
@@ -154,7 +155,7 @@ pub fn spawn(
 
     let bytes_per_second =
         usize::try_from(sample_rate).unwrap_or(48_000) * usize::from(channels) * 2;
-    tokio::spawn(pace(raw_rx, pcm_tx, bytes_per_second));
+    tokio::spawn(forward(raw_rx, pcm_tx, bytes_per_second));
 
     // ffmpeg says why it stopped on stderr, and a decoder that quietly does nothing is the worst
     // kind of silence.
@@ -177,81 +178,37 @@ pub fn spawn(
     ))
 }
 
-/// How much audio to gather before letting any of it out.
-///
-/// Enough to ride out the bursts that were measured, and no more: every millisecond here is a
-/// millisecond between pressing play on a phone and hearing it in the room.
-const PREROLL_MS: usize = 150;
-/// The most that may pile up before the oldest is dropped.
-///
-/// A buffer that only ever grows is latency that never comes back. A phone that runs slightly fast
-/// would otherwise push the room further behind for as long as the music lasts.
-const CEILING_MS: usize = 400;
-/// How often audio is handed on.
-const TICK_MS: usize = 20;
+/// How often the flow is said out loud.
+const REPORT_SECONDS: u64 = 10;
 
-/// Hand audio on at the rate it is meant to be played, whatever rate it arrives at.
-async fn pace(
+/// Hand the audio on as it comes, and say how much of it there was.
+///
+/// The report is the point of this being a function at all: a stream that is a few percent short of
+/// real time sounds broken while every average looks right, so the milliseconds are counted against
+/// the wall clock where anyone can see them.
+async fn forward(
     mut frames: mpsc::UnboundedReceiver<Vec<u8>>,
     out: mpsc::UnboundedSender<Vec<u8>>,
     bytes_per_second: usize,
 ) {
-    let per_tick = (bytes_per_second * TICK_MS / 1000).max(4);
-    let preroll = bytes_per_second * PREROLL_MS / 1000;
-    let ceiling = bytes_per_second * CEILING_MS / 1000;
-    let mut held: std::collections::VecDeque<u8> = std::collections::VecDeque::new();
-    let mut started = false;
-    let mut filled = 0usize;
-    let mut ticker = tokio::time::interval(Duration::from_millis(TICK_MS as u64));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-
-    loop {
-        tokio::select! {
-            chunk = frames.recv() => {
-                let Some(chunk) = chunk else { break };
-                held.extend(chunk);
-                if held.len() > ceiling {
-                    // Late is worse than short: drop what is oldest and keep the room close to the
-                    // phone rather than carrying a delay that never comes back.
-                    let excess = held.len() - ceiling;
-                    held.drain(..excess);
-                    debug!("bluetooth: dropped {excess} bytes to stay close to the phone");
-                }
-                if !started && held.len() >= preroll {
-                    started = true;
-                }
-            }
-            _ = ticker.tick(), if started => {
-                if held.len() < per_tick {
-                    // Nothing to send: the phone is behind. Filling the gap with silence keeps the
-                    // timeline whole, which is what the server places frames against.
-                    filled += per_tick;
-                    if out.send(vec![0u8; per_tick]).is_err() {
-                        return;
-                    }
-                    continue;
-                }
-                let chunk: Vec<u8> = held.drain(..per_tick).collect();
-                if out.send(chunk).is_err() {
-                    return;
-                }
-            }
-        }
-    }
-
-    // Whatever is left is real audio; the tail belongs to the room too.
-    while held.len() >= per_tick {
-        let chunk: Vec<u8> = held.drain(..per_tick).collect();
+    let mut sent = 0usize;
+    let mut last_report = tokio::time::Instant::now();
+    while let Some(chunk) = frames.recv().await {
+        sent += chunk.len();
         if out.send(chunk).is_err() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(TICK_MS as u64)).await;
-    }
-    if filled > 0 {
-        info!(
-            "bluetooth: filled {} ms of gaps while the phone was behind",
-            filled * 1000 / bytes_per_second.max(1)
-        );
+        let elapsed = last_report.elapsed();
+        if elapsed >= Duration::from_secs(REPORT_SECONDS) {
+            let carried = sent * 1000 / bytes_per_second.max(1);
+            let real = elapsed.as_millis().max(1) as usize;
+            info!(
+                "bluetooth: {carried} ms of audio in {real} ms ({}%)",
+                carried * 100 / real
+            );
+            sent = 0;
+            last_report = tokio::time::Instant::now();
+        }
     }
 }
 
@@ -268,47 +225,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bursts_go_in_and_a_steady_stream_comes_out() {
-        // One second of audio handed over in a single lump, as Bluetooth does on a bad moment.
+    async fn audio_is_handed_on_untouched_and_in_order() {
+        // Nothing is held back, nothing is invented, nothing is reordered: the phone's clock is the
+        // only clock this stream has.
         let (tx, rx) = mpsc::unbounded_channel();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let rate = 48_000 * 2 * 2;
-        tokio::spawn(pace(rx, out_tx, rate));
-        tx.send(vec![7u8; rate]).expect("the pacer is listening");
+        tokio::spawn(forward(rx, out_tx, 48_000 * 2 * 2));
+        tx.send(vec![1u8; 8]).expect("the forwarder is listening");
+        tx.send(vec![2u8; 8]).expect("the forwarder is listening");
+        drop(tx);
 
-        // Nothing comes out before its time: a lump in is not a lump out.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut got = 0;
-        while let Ok(chunk) = out_rx.try_recv() {
-            assert_eq!(chunk.len(), rate * TICK_MS / 1000);
-            got += chunk.len();
+        let mut out = Vec::new();
+        while let Some(chunk) = out_rx.recv().await {
+            out.extend(chunk);
         }
-        // About half a second of audio: the point is that a one-second lump did not come straight
-        // back out. Real time here, so the margin is generous on purpose.
-        let half = rate / 2;
-        let tick = rate * TICK_MS / 1000;
-        assert!(got > tick * 5, "hardly anything came out: {got}");
-        assert!(got < half + tick * 10, "the lump came straight back out: {got}");
-    }
-
-    #[tokio::test]
-    async fn a_gap_is_filled_rather_than_left() {
-        // A phone that falls behind must not leave a hole in the timeline: the server places frames
-        // by their timestamps, so a missing twenty milliseconds shifts everything after it.
-        let (tx, rx) = mpsc::unbounded_channel();
-        let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let rate = 48_000 * 2 * 2;
-        tokio::spawn(pace(rx, out_tx, rate));
-        tx.send(vec![7u8; rate * PREROLL_MS / 1000]).expect("the pacer is listening");
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        let mut silence = 0;
-        while let Ok(chunk) = out_rx.try_recv() {
-            if chunk.iter().all(|byte| *byte == 0) {
-                silence += chunk.len();
-            }
-        }
-        assert!(silence > 0, "the gap was left open");
+        assert_eq!(out, [vec![1u8; 8], vec![2u8; 8]].concat());
     }
 
     #[tokio::test]
