@@ -43,6 +43,9 @@ const REMOTE_NAME_PREFIX: &str = "BEORC";
 /// naming separately. It is a remote all the same: BLE HID, appearance 0x03c0, five buttons and a
 /// wheel. B&O's own BlueZ patches single it out by this exact string.
 const ESSENCE_NAME: &str = "BeoSound Essence";
+/// How the two models are spelled where the server and the admin screen read them.
+pub const KIND_ONE: &str = "one";
+pub const KIND_ESSENCE: &str = "essence";
 /// Where our agent lives on the bus. Anything unclaimed will do; this says who it belongs to.
 const AGENT_PATH: &str = "/sonn/agent";
 /// What this box claims it can do during pairing.
@@ -425,13 +428,12 @@ pub async fn paired_remotes(connection: &Connection) -> Vec<PairedRemote> {
             let name = string_property(properties, "Alias")
                 .or_else(|| string_property(properties, "Name"))
                 .unwrap_or_default();
-            if !is_remote_name(&name) {
-                return None;
-            }
+            let kind = remote_kind(&name)?;
             Some(PairedRemote {
                 address: string_property(properties, "Address")?,
                 name,
                 connected: bool_property(properties, "Connected").unwrap_or(false),
+                kind: kind.to_string(),
             })
         })
         .collect();
@@ -494,7 +496,18 @@ pub async fn forget_remote(address: &str) -> Result<()> {
 
 /// Whether a name belongs to a remote this client knows how to serve.
 fn is_remote_name(name: &str) -> bool {
-    name.starts_with(REMOTE_NAME_PREFIX) || name == ESSENCE_NAME
+    remote_kind(name).is_some()
+}
+
+/// Which model advertises under this name, if it is a remote at all.
+pub fn remote_kind(name: &str) -> Option<&'static str> {
+    if name.starts_with(REMOTE_NAME_PREFIX) {
+        Some(KIND_ONE)
+    } else if name == ESSENCE_NAME {
+        Some(KIND_ESSENCE)
+    } else {
+        None
+    }
 }
 
 /// Decide whether a discovered device is the remote we are waiting for.

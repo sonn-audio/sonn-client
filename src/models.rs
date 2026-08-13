@@ -148,6 +148,13 @@ pub struct PairedRemote {
     pub address: String,
     pub name: String,
     pub connected: bool,
+    /// `one` | `essence`. Which model this is, decided here rather than left to whoever renders it:
+    /// the two are not variants of one remote. A Beoremote One has a display we fill with menus and
+    /// eight keys a room can assign; an Essence has five fixed buttons and a wheel, so every one of
+    /// those settings is meaningless to it. Recognising them by name is the client's job already --
+    /// see `pairing::is_remote_name` -- so it says which it found instead of publishing the name and
+    /// making a screen guess.
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
