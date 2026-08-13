@@ -1,3 +1,10 @@
+# [1.6.0](https://github.com/sonn-audio/sonn-client/compare/v1.5.0...v1.6.0) (2026-08-13)
+
+
+### Features
+
+* **remote:** report which remotes are paired, and forget one ([b1b47bc](https://github.com/sonn-audio/sonn-client/commit/b1b47bc0c64778ca5ea12b2d3022c6f0639ea9cd))
+
 # [1.5.0](https://github.com/sonn-audio/sonn-client/compare/v1.4.2...v1.5.0) (2026-08-13)
 
 
