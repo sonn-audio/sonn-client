@@ -1,7 +1,21 @@
 # sonn-client
 
-A Sendspin-only audio endpoint for a Raspberry Pi or comparable device, installed with one command and
+A Raspberry Pi (or comparable box) turned into part of an audio system, installed with one command and
 configured entirely from the audioserver.
+
+It has four jobs, and every one of them is optional:
+
+| | |
+| --- | --- |
+| **Output** | Plays a room. One player per sound card, so a Pi with two DACs serves two rooms. |
+| **Input** | Listens to a turntable, a CD player, anything with a line out, and offers it to the server as a source. |
+| **Bluetooth** | Takes a phone: pairs it, receives the audio, and hands it to a room as an ordinary input. |
+| **Remote** | Serves the menus on a Beoremote One and sends its keys and picks to the server. |
+
+They are independent. A Pi standing at the record player can do the input and the Bluetooth without
+having a speaker attached at all, while the room those end up in is a different box across the house.
+A box with nothing but a DAC does only the output. Which of the four a device does is decided on the
+server, not here.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sonn-audio/sonn-client/main/install.sh | sudo bash
@@ -12,13 +26,18 @@ its sound cards, and waits to be given a room. Which card to use, what the room 
 delay, whether volume is done in software or by an amplifier — all of it is decided on the server and
 pushed down. Nothing here needs editing, and nothing here needs to be edited again when it changes.
 
-## Why only Sendspin
+## Why playback is Sendspin and nothing else
 
-AirPlay, DLNA, Chromecast, Spotify Connect and Bluetooth all still reach a speaker driven by this
-client — they are terminated on the **server**, which turns them into a Sendspin stream aimed here.
-The device runs one protocol and nothing else, which is what makes a room a room: one clock, one
-buffer model, one place where synchronisation is solved. Adding a second protocol to the device would
-mean a second answer to "when should this sample be heard", and there is no good second answer.
+AirPlay, DLNA, Chromecast and Spotify Connect all still reach a speaker driven by this client — they
+are terminated on the **server**, which turns them into a Sendspin stream aimed here. For playback the
+device runs one protocol and nothing else, which is what makes a room a room: one clock, one buffer
+model, one place where synchronisation is solved. A second playback protocol on the device would mean
+a second answer to "when should this sample be heard", and there is no good second answer.
+
+Bluetooth is the exception that proves the rule, and it is an *input*. A phone's radio only reaches
+the room it is in, so the thing that hears it has to be in that room too — but what leaves this client
+is PCM announced as an ordinary source, exactly like the turntable next to it. Nothing about the
+playback side changes: the room still hears one protocol, on one clock.
 
 ## What it does
 
@@ -29,9 +48,11 @@ mean a second answer to "when should this sample be heard", and there is no good
 - Runs one Sendspin **source** per configured input: a line-in, a turntable preamp, a CD player goes
   up to the server and comes back as a zone like anything else, with level and line-sense reporting so
   the server knows when someone started playing.
-- Serves the menus on a **Beoremote One** and forwards its keys and picks to the server.
-- Installs and updates the software those features need (B&O's patched BlueZ), on the server's
-  instruction and with a checksum.
+- Pairs a **phone over Bluetooth**, decodes what it sends, and offers it to the server as a source —
+  with the phone's own now-playing, its volume slider, and the room's name on the phone's screen.
+- Serves the menus on a **Beoremote One** and forwards its keys and picks to the server, on stock
+  BlueZ: the client provides the remote's own service and reads its keys from the kernel.
+- Updates itself, on the server's instruction and against a checksum.
 - Applies volume, mute and output delay to a live player; reconnects only when it must (a different
   card, a different rate, a different server).
 - Drives hardware volume through a hook when a speaker has real volume of its own, leaving the
@@ -61,7 +82,7 @@ sonn-client                       # run (what systemd does)
 sudo sonn-client install          # write the systemd unit, enable and start it
 sonn-client devices               # list the sound cards the server will be offered
 sudo sonn-client pair-remote      # pair a Beoremote One (90s window: scan, pair, trust, connect)
-sonn-client components            # what is installed of the managed software
+sudo sonn-client bluetooth        # be findable as a speaker, without a server (name, seconds)
 sonn-client devices --log-level debug  # ...including the ones left out, and why
 sonn-client --log-level info run       # run in the foreground with logs
 ```
@@ -181,8 +202,10 @@ turns it on because nothing asked.
 
 ## Beoremote One
 
-With B&O's patched BlueZ installed (see below), a Beoremote One shows your own sources, submenus and
-playlists instead of three dots. The menu comes from the server, so adding a playlist is server-side
+A Beoremote One shows your own sources, submenus and playlists instead of three dots — on stock
+BlueZ. B&O do it with a patched daemon of their own; this client instead serves the remote's service
+itself and reads its keys from the kernel's input devices, so there is nothing to install on the
+device beyond this binary. The menu comes from the server, so adding a playlist is server-side
 work with nothing to deploy here; keys go up as raw codes, because only the server knows whether
 `next` should advance a queue or become a Beo4 command. Volume is the exception and stays local: it
 arrives in bursts and has to survive the server being briefly away.
@@ -193,20 +216,30 @@ Pairing is one command (or one button in the server's UI, which queues it):
 sudo sonn-client pair-remote        # then put the remote into pairing mode
 ```
 
-## Managed components
+## Bluetooth
 
-`beoremote-bluetoothd` — B&O's patched BlueZ 5.45, which is what serves the remote's menus — is
-installed by this client on the server's instruction, verified against a sha256, and reported back. It
-is deliberately **not** part of this binary: it is GPLv2 (B&O publish their patches because BlueZ
-leaves them no choice, and linking it in would relicense this client), and it is a whole `bluetoothd`
-that owns the Bluetooth adapter, which most devices have no use for.
+A phone pairs with the room rather than with a box: the adapter takes the zone's name, so what
+someone sees in their phone's list is "Kitchen". The audio arrives as SBC, is decoded here, and goes
+up as an ordinary source — which is why nothing downstream knows or cares that a room's music came
+from a phone. What the phone says it is playing, and where its volume slider is, come along with it.
 
-Build the artifact from [`beoremote-linux`](https://github.com/sonn-audio/beoremote-linux) and host it
-per architecture; the server hands out the URL and checksum.
+Two things are worth knowing before deploying it next to a remote. One radio serves both, and a
+Beoremote One holds its connection open the whole time, which measurably starves the audio (83-94% of
+real time arriving, against 99-100% with the remote gone) — so the remote stands aside while a phone
+plays and is called back the moment it stops. And artwork does not travel: a phone offers cover art
+over a separate OBEX channel that BlueZ has no client for, so the room shows title, artist and album
+but no picture.
+
+## Updates
+
+The client updates itself on the server's instruction, verified against a sha256 and reported back.
+It waits for the music to stop before replacing itself.
 
 ## Roadmap
 
-- A pairing agent of our own, so an unattended re-pair needs no `bluetoothctl`.
+- Transport keys from the room back to a phone over AVRCP: the client end is built, the server does
+  not yet queue them.
+- Cover art over Bluetooth, which needs an AVRCP controller and an OBEX client of our own.
 - Optional Opus/FLAC on the way up from a source, for a wifi-only device on a long haul.
 
 Both are sketched in [docs/PROTOCOL.md](docs/PROTOCOL.md#roadmap-on-the-device).
