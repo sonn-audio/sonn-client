@@ -501,12 +501,13 @@ pub async fn paired_remotes(connection: &Connection) -> Vec<PairedRemote> {
     remotes
 }
 
-/// Ask a paired remote to come back.
+/// Ask a remote to come back, once.
 ///
-/// Costs nothing when it is asleep or out of range -- bluez answers "not available" and the next
-/// tick tries again -- and it is the only way a remote that wakes with undirected advertisements
-/// reaches a stock daemon at all.
-pub async fn call_remote(connection: &Connection, address: &str) {
+/// Only ever right after [`disconnect_remote`], and never on a timer: asking a *sleeping* remote to
+/// connect once a minute is what took a Beoremote One's fresh batteries to half in a day. One call
+/// to a remote that was awake a second ago costs it nothing like that, and it is what makes a menu
+/// change visible before somebody looks rather than one key press later.
+pub async fn wake_remote(connection: &Connection, address: &str) {
     let path = format!("/org/bluez/hci0/dev_{}", address.replace(':', "_"));
     let Ok(builder) = DeviceProxy::builder(connection).path(path) else {
         return;
@@ -515,8 +516,29 @@ pub async fn call_remote(connection: &Connection, address: &str) {
         return;
     };
     match device.connect().await {
-        Ok(()) => info!("remote {address} is back"),
-        Err(err) => debug!("remote {address} did not answer: {err}"),
+        Ok(()) => info!("{address} is back for the new menu"),
+        Err(err) => debug!("{address} stayed away: {err}"),
+    }
+}
+
+/// Drop a remote's link, so it reads everything again the next time it is used.
+///
+/// The only way to tell a Beoremote One that the menu changed. It reads the lists when it connects
+/// and never asks again -- it does not subscribe to the attribute that exists to say "read again",
+/// measured across a full pairing -- and a One holds its link open for days. So a menu it read on
+/// Monday is the menu it shows on Friday unless the link is broken. It comes back on the next key
+/// press, which is exactly when someone is looking at it.
+pub async fn disconnect_remote(connection: &Connection, address: &str) {
+    let path = format!("/org/bluez/hci0/dev_{}", address.replace(':', "_"));
+    let Ok(builder) = DeviceProxy::builder(connection).path(path) else {
+        return;
+    };
+    let Ok(device) = builder.build().await else {
+        return;
+    };
+    match device.disconnect().await {
+        Ok(()) => info!("dropped {address}'s link so it reads the new menu"),
+        Err(err) => debug!("could not drop {address}'s link: {err}"),
     }
 }
 
