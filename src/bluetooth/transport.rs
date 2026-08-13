@@ -83,6 +83,10 @@ pub fn payload(packet: &[u8]) -> Option<Payload<'_>> {
 pub fn read_stream(fd: OwnedFd, read_mtu: u16, counters: Arc<StreamCounters>) -> Result<()> {
     let mut buffer = vec![0u8; usize::from(read_mtu).max(1024)];
     let raw = fd.as_raw_fd();
+    // bluez hands the socket over non-blocking, and this reader has a thread of its own precisely so
+    // it can wait. Left as it comes, the first read returns EAGAIN before the phone has sent
+    // anything and the stream looks like it ended a millisecond after it started.
+    make_blocking(raw).context("make the transport socket blocking")?;
     info!("bluetooth: reading audio, up to {read_mtu} bytes per packet");
 
     loop {
@@ -94,7 +98,12 @@ pub fn read_stream(fd: OwnedFd, read_mtu: u16, counters: Arc<StreamCounters>) ->
             }
             n if n < 0 => {
                 let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::Interrupted {
+                // A signal, or a socket that says "not yet" despite being blocking: neither is the
+                // end of the music.
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                ) {
                     continue;
                 }
                 return Err(anyhow!(err).context("read the bluetooth transport"));
@@ -121,6 +130,26 @@ pub fn read_stream(fd: OwnedFd, read_mtu: u16, counters: Arc<StreamCounters>) ->
 extern "C" {
     #[link_name = "recv"]
     fn libc_recv_raw(fd: i32, buf: *mut u8, len: usize, flags: i32) -> isize;
+    #[link_name = "fcntl"]
+    fn libc_fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+}
+
+/// `F_GETFL` / `F_SETFL` with `O_NONBLOCK` cleared.
+fn make_blocking(fd: i32) -> Result<()> {
+    const F_GETFL: i32 = 3;
+    const F_SETFL: i32 = 4;
+    const O_NONBLOCK: i32 = 0o4000;
+    let flags = unsafe { libc_fcntl(fd, F_GETFL, 0) };
+    if flags < 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()));
+    }
+    if flags & O_NONBLOCK == 0 {
+        return Ok(());
+    }
+    if unsafe { libc_fcntl(fd, F_SETFL, flags & !O_NONBLOCK) } < 0 {
+        return Err(anyhow!(std::io::Error::last_os_error()));
+    }
+    Ok(())
 }
 
 unsafe fn libc_recv(fd: i32, buf: *mut u8, len: usize) -> isize {

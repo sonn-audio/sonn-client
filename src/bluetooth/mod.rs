@@ -59,6 +59,16 @@ trait AgentManager {
     fn request_default_agent(&self, agent: &ObjectPath<'_>) -> zbus::Result<()>;
 }
 
+#[proxy(interface = "org.bluez.Device1", default_service = "org.bluez")]
+trait Device {
+    /// Ask for the profiles this device and we have in common -- for a phone, A2DP.
+    fn connect(&self) -> zbus::Result<()>;
+    /// Ask for one profile by name, which is what to do when the link is up but the audio is not.
+    fn connect_profile(&self, uuid: &str) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn set_trusted(&self, trusted: bool) -> zbus::Result<()>;
+}
+
 #[proxy(interface = "org.bluez.Adapter1", default_service = "org.bluez")]
 trait Adapter {
     fn remove_device(&self, device: &ObjectPath<'_>) -> zbus::Result<()>;
@@ -279,6 +289,7 @@ fn offers_audio(properties: &Properties) -> bool {
 
 /// A2DP Source: "I have audio to send you", which is what a phone says and a remote does not.
 const A2DP_SOURCE: &str = "0000110a";
+const A2DP_SOURCE_UUID: &str = "0000110a-0000-1000-8000-00805f9b34fb";
 
 /// A2DP source and sink, AVRCP, and the two audio/video umbrella UUIDs a phone offers alongside.
 fn is_audio_service(uuid: &str) -> bool {
@@ -371,6 +382,7 @@ async fn serve(
     // Which transport is being read, so a phone that reconnects is picked up and one that is already
     // being read is not read twice.
     let mut reading: Option<OwnedObjectPath> = None;
+    let mut last_bytes = 0u64;
     info!(
         zone_id = config.zone_id,
         name = %config.name,
@@ -399,11 +411,23 @@ async fn serve(
             _ = poll.tick() => {
                 follow_stream(&connection, &endpoint, &counters, &mut reading).await;
                 let mut report = inspect(&connection, &adapter, config, &endpoint).await;
-                report.stream = Some(StreamReport {
+                let stream = StreamReport {
                     packets: counters.packets.load(std::sync::atomic::Ordering::Relaxed),
                     frames: counters.frames(),
                     bytes: counters.bytes.load(std::sync::atomic::Ordering::Relaxed),
-                });
+                };
+                // Said out loud while it moves: this is how anyone can tell audio is arriving,
+                // before there is any sound to hear it by.
+                if stream.bytes != last_bytes {
+                    info!(
+                        "bluetooth: {} packets, {} sbc frames, {} kB",
+                        stream.packets,
+                        stream.frames,
+                        stream.bytes / 1024
+                    );
+                    last_bytes = stream.bytes;
+                }
+                report.stream = Some(stream);
                 statuses.set_bluetooth(Some(report));
             }
         }
@@ -478,6 +502,20 @@ async fn inspect(
                 if !offers_audio(properties) {
                     continue;
                 }
+                let connected = bool_property(properties, "Connected").unwrap_or(false);
+                // A phone that is here but not sending is one whose audio session went with a
+                // restart of this process: the link survives, the A2DP session does not, and iOS
+                // does not rebuild it by itself. Asking once is what a speaker does.
+                if connected && streaming.is_none() {
+                    reconnect_audio(connection, &path).await;
+                }
+                // A paired phone is trusted, which is what makes it reconnect on its own. Without
+                // it every reconnection needs authorising again, and a phone that asks and does not
+                // get an answer in time simply drops back to its own speaker -- with nothing on
+                // either screen to say why.
+                if !bool_property(properties, "Trusted").unwrap_or(false) {
+                    trust(connection, &path).await;
+                }
                 let address = string_property(properties, "Address").unwrap_or_default();
                 report.devices.push(PairedPhone {
                     name: string_property(properties, "Alias")
@@ -487,7 +525,6 @@ async fn inspect(
                     streaming: streaming.as_deref() == Some(address.as_str()),
                     address,
                 });
-                let _ = path;
             }
         }
         Err(err) => report.last_error = Some(format!("{err:#}")),
@@ -498,6 +535,46 @@ async fn inspect(
         .sort_by(|a, b| b.connected.cmp(&a.connected).then_with(|| a.name.cmp(&b.name)));
     report.now_playing = metadata::now_playing(connection).await;
     report
+}
+
+/// Ask a connected phone for its audio again.
+async fn reconnect_audio(connection: &Connection, path: &OwnedObjectPath) {
+    let Ok(builder) = DeviceProxy::builder(connection).path(path.clone()) else {
+        return;
+    };
+    let Ok(device) = builder.build().await else {
+        return;
+    };
+    // The profile, not the device: the link is already up -- it is the audio session that went with
+    // the restart, and `Connect` on a connected device only answers "already connected".
+    match device.connect_profile(A2DP_SOURCE_UUID).await {
+        Ok(()) => info!("bluetooth: asked {} for its audio again", path.as_str()),
+        Err(err) => {
+            debug!("bluetooth: {} would not reconnect audio: {err}", path.as_str());
+            // Some phones will not answer a profile request but will take the whole device.
+            if let Err(err) = device.connect().await {
+                debug!("bluetooth: {} would not connect: {err}", path.as_str());
+            }
+        }
+    }
+}
+
+/// Trust a phone, so it can come back without asking again.
+async fn trust(connection: &Connection, path: &OwnedObjectPath) {
+    let device = match DeviceProxy::builder(connection).path(path.clone()) {
+        Ok(builder) => builder.build().await,
+        Err(err) => {
+            debug!("bluetooth: {err}");
+            return;
+        }
+    };
+    match device {
+        Ok(device) => match device.set_trusted(true).await {
+            Ok(()) => info!("bluetooth: {} may reconnect on its own", path.as_str()),
+            Err(err) => warn!("bluetooth: could not trust {}: {err}", path.as_str()),
+        },
+        Err(err) => debug!("bluetooth: {err}"),
+    }
 }
 
 async fn forget(connection: &Connection, adapter: &AdapterProxy<'_>, address: &str) {
