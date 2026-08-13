@@ -592,7 +592,16 @@ async fn run_bluetooth(name: Option<String>, window: Option<String>) -> Result<(
     );
 
     let (commands, receiver) = tokio::sync::mpsc::channel(4);
-    let radio = tokio::spawn(bluetooth::run(config, statuses.clone(), receiver));
+    // Nothing is playing in this mode, so volume requests have nowhere to go; the channel exists
+    // because the module takes one, and reading the phone's slider is still worth seeing in the log.
+    let (volume_tx, mut volume_rx) = tokio::sync::mpsc::channel(4);
+    tokio::spawn(async move { while volume_rx.recv().await.is_some() {} });
+    let radio = tokio::spawn(bluetooth::run(
+        config,
+        statuses.clone(),
+        receiver,
+        volume_tx,
+    ));
     // Open the window straight away: a command line that has to be told twice is a worse tool.
     let _ = commands.send(bluetooth::Command::Discoverable).await;
 

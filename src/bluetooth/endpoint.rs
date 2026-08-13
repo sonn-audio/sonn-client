@@ -81,6 +81,11 @@ pub(super) trait MediaTransport {
     fn device(&self) -> zbus::Result<OwnedObjectPath>;
     #[zbus(property)]
     fn configuration(&self) -> zbus::Result<Vec<u8>>;
+    /// AVRCP absolute volume, 0-127. What the slider on the phone means.
+    #[zbus(property)]
+    fn volume(&self) -> zbus::Result<u16>;
+    #[zbus(property)]
+    fn set_volume(&self, volume: u16) -> zbus::Result<()>;
 }
 
 /// What the endpoint has been told to carry, once a phone has agreed to it.

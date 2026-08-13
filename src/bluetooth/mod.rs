@@ -329,9 +329,10 @@ pub async fn run(
     config: BluetoothConfig,
     statuses: Registry,
     mut commands: mpsc::Receiver<Command>,
+    volume_tx: mpsc::Sender<crate::supervisor::VolumeRequest>,
 ) {
     loop {
-        match serve(&config, &statuses, &mut commands).await {
+        match serve(&config, &statuses, &mut commands, &volume_tx).await {
             Ok(()) => {
                 info!("bluetooth: stopped");
                 return;
@@ -355,6 +356,7 @@ async fn serve(
     config: &BluetoothConfig,
     statuses: &Registry,
     commands: &mut mpsc::Receiver<Command>,
+    volume_tx: &mpsc::Sender<crate::supervisor::VolumeRequest>,
 ) -> Result<()> {
     let connection = Connection::system()
         .await
@@ -383,6 +385,10 @@ async fn serve(
     // being read is not read twice.
     let mut reading: Option<OwnedObjectPath> = None;
     let mut last_bytes = 0u64;
+    // The phone's slider, as last seen. Absolute volume arrives as a property on the transport, and
+    // it is the one thing B&O put real work into on this path: a phone whose volume does nothing is
+    // a phone whose owner turns the speaker up by hand and then blames the speaker.
+    let mut last_volume: Option<u16> = None;
     info!(
         zone_id = config.zone_id,
         name = %config.name,
@@ -410,6 +416,7 @@ async fn serve(
             }
             _ = poll.tick() => {
                 follow_stream(&connection, &endpoint, &counters, &mut reading).await;
+                follow_volume(&connection, &endpoint, config, volume_tx, &mut last_volume).await;
                 let mut report = inspect(&connection, &adapter, config, &endpoint).await;
                 let stream = StreamReport {
                     packets: counters.packets.load(std::sync::atomic::Ordering::Relaxed),
@@ -432,6 +439,49 @@ async fn serve(
             }
         }
     }
+}
+
+/// Follow the phone's own volume slider.
+///
+/// AVRCP absolute volume runs 0-127 and the rest of this system runs 0-100, so the one is scaled to
+/// the other -- rounding up, so that a nudge off zero is audible rather than silently still zero.
+/// Only changes are passed on: the property is read every few seconds and re-applying the same
+/// number would fight whoever is turning the knob in the room.
+async fn follow_volume(
+    connection: &Connection,
+    endpoint: &A2dpEndpoint,
+    config: &BluetoothConfig,
+    volume_tx: &mpsc::Sender<crate::supervisor::VolumeRequest>,
+    last: &mut Option<u16>,
+) {
+    if !config.control {
+        return;
+    }
+    let Some(path) = endpoint.transport().path else {
+        *last = None;
+        return;
+    };
+    let Ok(builder) = endpoint::MediaTransportProxy::builder(connection).path(path) else {
+        return;
+    };
+    let Ok(transport) = builder.build().await else {
+        return;
+    };
+    let Ok(volume) = transport.volume().await else {
+        return;
+    };
+    if *last == Some(volume) {
+        return;
+    }
+    *last = Some(volume);
+    let scaled = ((u32::from(volume) * 100 + 126) / 127).min(100) as u8;
+    info!("bluetooth: the phone set the volume to {scaled}");
+    let _ = volume_tx
+        .send(crate::supervisor::VolumeRequest {
+            client_id: None,
+            intent: crate::supervisor::VolumeIntent::Set(scaled),
+        })
+        .await;
 }
 
 /// Take the socket as soon as a phone starts playing, and let it go when it stops.

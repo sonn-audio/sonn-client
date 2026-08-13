@@ -114,7 +114,7 @@ pub async fn run(
         reconcile_sources(&desired, &mut sources, &ctx).await;
         reconcile_adapter_name(&desired, &mut adapter_name);
         reconcile_beoremote(&desired, &mut beoremote, &ctx, &volume_tx);
-        reconcile_bluetooth(&desired, &mut bluetooth, &ctx);
+        reconcile_bluetooth(&desired, &mut bluetooth, &ctx, &volume_tx);
 
         tokio::select! {
             changed = desired_rx.changed() => {
@@ -486,6 +486,7 @@ fn reconcile_bluetooth(
     desired: &DesiredConfig,
     running: &mut Option<RunningBluetooth>,
     ctx: &SupervisorContext,
+    volume_tx: &mpsc::Sender<VolumeRequest>,
 ) {
     let wanted = desired
         .bluetooth
@@ -515,8 +516,9 @@ fn reconcile_bluetooth(
     // Room for a burst: an operator can press pair twice, and a phone can be forgotten while the
     // window is open, without either being dropped.
     let (commands, receiver) = mpsc::channel(8);
+    let volume_tx = volume_tx.clone();
     let handle = tokio::spawn(async move {
-        bluetooth::run(config, statuses, receiver).await;
+        bluetooth::run(config, statuses, receiver, volume_tx).await;
     });
     ctx.bluetooth_commands.set(Some(commands.clone()));
     *running = Some(RunningBluetooth {
