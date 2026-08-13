@@ -98,6 +98,7 @@ pub async fn run(
     let mut sources: HashMap<String, RunningSource> = HashMap::new();
     let mut beoremote: Option<RunningBeoremote> = None;
     let mut bluetooth: Option<RunningBluetooth> = None;
+    let mut adapter_name: Option<String> = None;
     let (volume_tx, mut volume_rx) = mpsc::channel::<VolumeRequest>(VOLUME_QUEUE);
     // Components are reconciled on change only: it writes files and restarts services, which is not
     // something to redo every five seconds.
@@ -111,6 +112,7 @@ pub async fn run(
         reconcile_components(&desired, &ctx, &mut component_key).await;
         reconcile_players(&desired, &mut players, &ctx).await;
         reconcile_sources(&desired, &mut sources, &ctx).await;
+        reconcile_adapter_name(&desired, &mut adapter_name);
         reconcile_beoremote(&desired, &mut beoremote, &ctx, &volume_tx);
         reconcile_bluetooth(&desired, &mut bluetooth, &ctx);
 
@@ -444,6 +446,30 @@ async fn stop_all_sources(running: &mut HashMap<String, RunningSource>) {
     for (_, entry) in running.drain().collect::<Vec<_>>() {
         stop_source(entry).await;
     }
+}
+
+// ---------------------------------------------------------------------------- adapter name
+
+/// Give the radio the room's name, once, wherever it is used.
+///
+/// The adapter carries a single name, and everyone who reads it -- a phone looking for a speaker, a
+/// Beoremote One listing its products -- should see the room. Set when it changes and not before:
+/// renaming an adapter a remote is paired to makes the remote show a different product, so it is
+/// worth doing exactly as often as the room is actually renamed.
+fn reconcile_adapter_name(desired: &DesiredConfig, current: &mut Option<String>) {
+    let Some(name) = desired.adapter_name() else {
+        return;
+    };
+    if current.as_deref() == Some(name.as_str()) {
+        return;
+    }
+    *current = Some(name.clone());
+    tokio::spawn(async move {
+        match bluetooth::set_adapter_name(&name).await {
+            Ok(()) => info!("the bluetooth adapter is now called {name}"),
+            Err(err) => warn!("could not name the bluetooth adapter: {err:#}"),
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------- bluetooth

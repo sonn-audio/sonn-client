@@ -330,6 +330,29 @@ pub struct DesiredBluetooth {
     pub control: Option<bool>,
 }
 
+impl DesiredConfig {
+    /// What this device's Bluetooth adapter should be called.
+    ///
+    /// One radio, one name, and it is the room's: a phone looking for a speaker, a Beoremote One
+    /// listing its products, AirPlay and DLNA all show the same thing to the same person. The
+    /// Bluetooth zone names it when there is one, because that is the name a stranger reads; the
+    /// remote's zone otherwise.
+    pub fn adapter_name(&self) -> Option<String> {
+        self.bluetooth
+            .as_ref()
+            .filter(|entry| entry.enabled == Some(true))
+            .and_then(|entry| entry.name.clone())
+            .or_else(|| {
+                self.beoremote
+                    .as_ref()
+                    .filter(|entry| entry.is_enabled())
+                    .and_then(|entry| entry.zone_name.clone())
+            })
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+    }
+}
+
 /// Beoremote One support for this device.
 ///
 /// The remote talks to a patched `bluetoothd` (the `sonn-beoremote` component) over two unix
@@ -342,6 +365,9 @@ pub struct DesiredBeoremote {
     /// Zone whose menu this remote shows and whose keys it drives. Required to do anything.
     #[serde(default)]
     pub zone_id: Option<u32>,
+    /// That zone's name, which is what the adapter is called -- see `adapter_name`.
+    #[serde(default)]
+    pub zone_name: Option<String>,
     /// Base URL for the beoremote API. Absent means the server we are registered with.
     #[serde(default)]
     pub api_base_url: Option<String>,

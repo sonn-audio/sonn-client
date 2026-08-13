@@ -280,6 +280,20 @@ fn is_audio_service(uuid: &str) -> bool {
     AUDIO.iter().any(|known| uuid.starts_with(known))
 }
 
+/// Name the adapter, which is what a phone and a Beoremote One both read.
+pub async fn set_adapter_name(name: &str) -> Result<()> {
+    let connection = Connection::system()
+        .await
+        .context("connect to the system bus")?;
+    let adapter = AdapterProxy::builder(&connection)
+        .path(ADAPTER_PATH)?
+        .build()
+        .await
+        .context("talk to the adapter")?;
+    adapter.set_alias(name).await.context("name the adapter")?;
+    Ok(())
+}
+
 /// Set the radio up for this zone and keep it that way until told otherwise.
 pub async fn run(
     config: BluetoothConfig,
@@ -321,13 +335,9 @@ async fn serve(
         .await
         .context("talk to the adapter")?;
 
-    // The name a phone sees is the room's, and it is set every time: a zone that was renamed should
-    // show up renamed without anyone thinking about it.
+    // The name is not set here: one radio carries one name for everything that reads it, so the
+    // supervisor sets it from whichever zone claims this device -- see `set_adapter_name`.
     adapter.set_powered(true).await.ok();
-    adapter
-        .set_alias(&config.name)
-        .await
-        .context("name the adapter")?;
     // Pairable, but not findable until someone asks. A speaker that is permanently discoverable is
     // one every passer-by can see.
     adapter.set_pairable(true).await.ok();
