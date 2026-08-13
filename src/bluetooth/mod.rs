@@ -408,6 +408,9 @@ async fn serve(
     // being read is not read twice.
     let mut reading: Option<OwnedObjectPath> = None;
     let mut streaming: Option<Streaming> = None;
+    // When each phone was last asked for its audio, so it is asked at most once in a while.
+    let mut asked: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
     let mut last_bytes = 0u64;
     // The phone's slider, as last seen. Absolute volume arrives as a property on the transport, and
     // it is the one thing B&O put real work into on this path: a phone whose volume does nothing is
@@ -456,7 +459,8 @@ async fn serve(
                 )
                 .await;
                 follow_volume(&connection, &endpoint, config, volume_tx, &mut last_volume).await;
-                let mut report = inspect(&connection, &adapter, config, &endpoint).await;
+                let mut report =
+                    inspect(&connection, &adapter, config, &endpoint, &mut asked).await;
                 let stream = StreamReport {
                     packets: counters.packets.load(std::sync::atomic::Ordering::Relaxed),
                     frames: counters.frames(),
@@ -653,6 +657,7 @@ async fn inspect(
     adapter: &AdapterProxy<'_>,
     config: &BluetoothConfig,
     endpoint: &A2dpEndpoint,
+    asked: &mut std::collections::HashMap<String, std::time::Instant>,
 ) -> BluetoothStatus {
     let mut report = BluetoothStatus {
         enabled: true,
@@ -681,8 +686,17 @@ async fn inspect(
                 let connected = bool_property(properties, "Connected").unwrap_or(false);
                 // A phone that is here but not sending is one whose audio session went with a
                 // restart of this process: the link survives, the A2DP session does not, and iOS
-                // does not rebuild it by itself. Asking once is what a speaker does.
-                if connected && streaming.is_none() {
+                // does not rebuild it by itself. So it is asked -- but rarely.
+                //
+                // Rarely, because a phone that simply is not playing anything answers this happily
+                // and goes on not playing anything, and because iOS drops the profile again straight
+                // afterwards, which looks exactly like a phone that needs asking. Asking every poll
+                // turned into a speaker tugging at someone's sleeve three times a second.
+                let due = asked
+                    .get(path.as_str())
+                    .is_none_or(|last| last.elapsed() >= RECONNECT_COOLDOWN);
+                if connected && streaming.is_none() && due {
+                    asked.insert(path.as_str().to_string(), std::time::Instant::now());
                     reconnect_audio(connection, &path).await;
                 }
                 // A paired phone is trusted, which is what makes it reconnect on its own. Without
@@ -712,6 +726,9 @@ async fn inspect(
     report.now_playing = metadata::now_playing(connection).await;
     report
 }
+
+/// How long to leave a phone alone between asking it for its audio.
+const RECONNECT_COOLDOWN: Duration = Duration::from_secs(60);
 
 /// Ask a connected phone for its audio again.
 async fn reconnect_audio(connection: &Connection, path: &OwnedObjectPath) {
