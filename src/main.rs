@@ -18,6 +18,7 @@ mod health;
 mod hooks;
 mod identity;
 mod install;
+mod logbuf;
 mod models;
 mod pairing;
 mod player;
@@ -35,6 +36,8 @@ use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::watch;
 use tracing::{info, warn};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::discovery::DiscoveredServer;
 use crate::models::{
@@ -57,6 +60,9 @@ const MAX_PLAYERS: u8 = 4;
 const DECLINED_RETRY_AFTER: Duration = Duration::from_secs(10 * 60);
 /// Pause when every audioserver on the network has declined, so the search does not become a poll.
 const DISCOVERY_BACKOFF: Duration = Duration::from_secs(60);
+/// How many log lines are sent when the server does not say. Enough to cover a startup or a failed
+/// pairing without making the answer a file.
+const DEFAULT_LOG_LINES: usize = 200;
 /// Named extras this build ships, so the server can offer the matching configuration.
 const FEATURES: [&str; 3] = ["source", "beoremote", "bluetooth"];
 
@@ -64,11 +70,20 @@ const FEATURES: [&str; 3] = ["source", "beoremote", "bluetooth"];
 async fn main() -> Result<()> {
     let (command, arguments, log_level) = parse_args()?;
     let argument = arguments.first().cloned();
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::new(default_log_filter(
+    // Two layers over one filter: the usual one to stdout (the journal, when systemd started this)
+    // and a second into the in-memory buffer the server can ask for. Same lines, no colour codes in
+    // the copy that travels.
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::new(default_log_filter(
             command.as_deref(),
             log_level,
         )))
+        .with(tracing_subscriber::fmt::layer())
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(logbuf::MakeLog),
+        )
         .init();
     alsa_quiet::install();
 
@@ -383,7 +398,15 @@ async fn status_loop(
                 for command in &desired.commands {
                     // Built-ins first: a command this client can carry out itself should not need a
                     // script on the device to be useful.
-                    if handle_builtin_command(command, &statuses, &bluetooth_commands).await {
+                    if handle_builtin_command(
+                        command,
+                        &statuses,
+                        &bluetooth_commands,
+                        &api,
+                        &device_id,
+                    )
+                    .await
+                    {
                         continue;
                     }
                     hooks.command(&command.command, &command.args).await;
@@ -471,6 +494,8 @@ async fn handle_builtin_command(
     command: &DeviceCommand,
     statuses: &status::Registry,
     bluetooth_commands: &bluetooth::CommandBus,
+    api: &ServerApi,
+    device_id: &str,
 ) -> bool {
     match command.command.as_str() {
         "pair_remote" => {
@@ -481,6 +506,26 @@ async fn handle_builtin_command(
             tokio::spawn(async move {
                 if let Err(err) = pairing::pair_remote(&statuses, address, None).await {
                     warn!("pairing failed to start: {:#}", err);
+                }
+            });
+            true
+        }
+        // Hand over the log. Asked for rather than streamed: see `logbuf`.
+        "send_logs" => {
+            let lines = command
+                .args
+                .first()
+                .and_then(|count| count.parse::<usize>().ok())
+                .unwrap_or(DEFAULT_LOG_LINES);
+            let lines = logbuf::lines(lines);
+            let api = api.clone();
+            let device_id = device_id.to_string();
+            // Spawned so a slow or absent server cannot hold up the rest of this poll's commands.
+            tokio::spawn(async move {
+                let count = lines.len();
+                match api.post_logs(&device_id, &lines).await {
+                    Ok(()) => info!("sent {count} log lines"),
+                    Err(err) => warn!("could not send the log: {err:#}"),
                 }
             });
             true
