@@ -1,3 +1,10 @@
+# [1.8.0](https://github.com/sonn-audio/sonn-client/compare/v1.7.0...v1.8.0) (2026-08-13)
+
+
+### Features
+
+* **logs:** hand over the device's own log when asked ([cdd67f5](https://github.com/sonn-audio/sonn-client/commit/cdd67f5e2d910695740f272b3432e938aff32c78))
+
 # [1.7.0](https://github.com/sonn-audio/sonn-client/compare/v1.6.0...v1.7.0) (2026-08-13)
 
 
