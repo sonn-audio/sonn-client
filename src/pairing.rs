@@ -68,6 +68,10 @@ const BLUEZ: &str = "org.bluez";
 const PAIR_TIMEOUT: Duration = Duration::from_secs(40);
 /// How long to wait for the first connection. Short: it is a courtesy, not the pairing.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for the remote to advertise again after its old bond was cleared. It is in
+/// pairing mode and advertising every fraction of a second; this only has to outlast bluez taking
+/// the object away and building it back.
+const REDISCOVER_TIMEOUT: Duration = Duration::from_secs(20);
 /// How many times to ask for a pairing before giving up. See `pair_with_retries`.
 const PAIR_ATTEMPTS: u32 = 3;
 /// How long to wait between those attempts, so the record can be filled in from an advertisement.
@@ -315,7 +319,33 @@ async fn run_pairing(address: Option<String>, window: Duration) -> Result<Option
     // A device that is merely *listed* is not a bond, it is the discovery cache, and it is worth
     // keeping: the name only appears in a scan response, so between advertising bursts that cache
     // entry is the only place the name is written down. Removing it cost an entire window once.
-    forget_existing_bonds(&connection, &adapter, Some(&found.address)).await;
+    let forgotten = forget_existing_bonds(&connection, &adapter, Some(&found.address)).await;
+
+    // Removing a bond takes the device object with it, so the path just discovered no longer
+    // exists. Pairing on it fails with "Method Pair doesn't exist" -- three times, because the
+    // retries use the same dead path -- and the remote is left unpaired: the bond was dropped and
+    // nothing replaced it. So wait for bluez to rebuild the object from the next advertisement,
+    // which a remote in pairing mode sends constantly, and keep scanning until it does.
+    let found = if forgotten {
+        match timeout(
+            REDISCOVER_TIMEOUT,
+            watch_for_remote(&connection, Some(&found.address)),
+        )
+        .await
+        {
+            Ok(found) => found?,
+            Err(_) => {
+                let _ = adapter.stop_discovery().await;
+                anyhow::bail!(
+                    "{} did not advertise again after its old pairing was cleared; put it back \
+                     into pairing mode and try once more",
+                    found.address
+                );
+            }
+        }
+    } else {
+        found
+    };
 
     // Stop scanning before connecting. An adapter that is still sweeping channels is a slower and
     // less reliable one to establish a link with, and BlueZ would suspend the discovery anyway.
@@ -581,14 +611,15 @@ async fn forget_existing_bonds(
     connection: &Connection,
     adapter: &AdapterProxy<'_>,
     target: Option<&str>,
-) {
+) -> bool {
     let objects = match managed_objects(connection).await {
         Ok(objects) => objects,
         Err(err) => {
             debug!("could not list what the adapter knows: {err:#}");
-            return;
+            return false;
         }
     };
+    let mut removed = false;
     for (path, interfaces) in objects {
         let Some(properties) = interface(&interfaces, "org.bluez.Device1") else {
             continue;
@@ -607,10 +638,14 @@ async fn forget_existing_bonds(
             continue;
         }
         match adapter.remove_device(&path.as_ref()).await {
-            Ok(()) => info!("forgot the previous pairing for {address}"),
+            Ok(()) => {
+                info!("forgot the previous pairing for {address}");
+                removed = true;
+            }
             Err(err) => warn!("could not forget the previous pairing for {address}: {err}"),
         }
     }
+    removed
 }
 
 /// What `GetManagedObjects` hands back: every object BlueZ exposes, with its interfaces and their
