@@ -64,6 +64,7 @@ trait AgentManager {
 trait Device {
     /// Ask for the profiles this device and we have in common -- for a phone, A2DP.
     fn connect(&self) -> zbus::Result<()>;
+    fn disconnect(&self) -> zbus::Result<()>;
     /// Ask for one profile by name, which is what to do when the link is up but the audio is not.
     fn connect_profile(&self, uuid: &str) -> zbus::Result<()>;
     #[zbus(property)]
@@ -540,6 +541,8 @@ async fn follow_volume(
 struct Streaming {
     decoder: decode::Decoder,
     source: tokio::task::JoinHandle<()>,
+    /// Devices put aside for the duration, to be called back when the music stops.
+    quieted: Vec<OwnedObjectPath>,
 }
 
 impl Drop for Streaming {
@@ -564,8 +567,9 @@ async fn follow_stream(
     let Some(path) = transport_state.path.clone() else {
         // The phone disconnected or stopped: close the decoder and end the source, which is what
         // tells the server this input has gone quiet.
-        if streaming.take().is_some() {
+        if let Some(stopped) = streaming.take() {
             info!("bluetooth: the stream ended");
+            wake_the_radio(connection, &stopped.quieted).await;
         }
         *reading = None;
         return;
@@ -574,8 +578,9 @@ async fn follow_stream(
     // state is the only thing that says whether there is still music.
     let state = transport::state(connection, &path).await;
     if state != "active" && state != "pending" {
-        if streaming.take().is_some() {
+        if let Some(stopped) = streaming.take() {
             info!("bluetooth: the phone stopped");
+            wake_the_radio(connection, &stopped.quieted).await;
         }
         *reading = None;
         return;
@@ -616,6 +621,8 @@ async fn follow_stream(
                 }
             };
             let frames = started.decoder.frames.clone();
+            let mut started = started;
+            started.quieted = quiet_the_radio(connection).await;
             *streaming = Some(started);
 
             let counters = std::sync::Arc::clone(counters);
@@ -666,6 +673,7 @@ fn start_source(config: &BluetoothConfig, sample_rate: u32, channels: u8) -> Res
     Ok(Streaming {
         decoder,
         source: handle,
+        quieted: Vec::new(),
     })
 }
 
@@ -765,6 +773,73 @@ fn due(
     asked
         .get(path.as_str())
         .is_none_or(|last| last.elapsed() >= RECONNECT_COOLDOWN)
+}
+
+/// Put everything that is not the music off the air for as long as the music lasts.
+///
+/// One radio, two jobs. A Beoremote One holds a connection open the whole time it is paired, and
+/// every one of its connection events is a slot the phone's audio does not get: measured here, 83
+/// to 94 percent of the audio arriving while it was connected against 99 to 100 with it gone, and
+/// the room hearing every bit of that difference. Relaxing the connection's timing was tried and
+/// changed nothing -- the cost is in the link itself, and the remote negotiates its own terms.
+///
+/// So the remote steps aside while a phone plays. It is a real loss: the remote is deaf until it
+/// comes back, and the key press that wakes it is the one that gets lost. It is offered here anyway
+/// because the alternative is music that stutters, and because the remote picks itself up -- and is
+/// called back the moment the music stops.
+async fn quiet_the_radio(connection: &Connection) -> Vec<OwnedObjectPath> {
+    let mut quieted = Vec::new();
+    let Ok(objects) = managed_objects(connection).await else {
+        return quieted;
+    };
+    for (path, interfaces) in objects {
+        let Some(properties) = interface(&interfaces, "org.bluez.Device1") else {
+            continue;
+        };
+        if !bool_property(properties, "Connected").unwrap_or(false) {
+            continue;
+        }
+        // Everything that is not something to listen to. A second phone stays: it is not costing
+        // airtime unless it plays, and taking someone else's music away is not this module's call.
+        if offers_audio(properties) {
+            continue;
+        }
+        let name = string_property(properties, "Alias")
+            .or_else(|| string_property(properties, "Name"))
+            .unwrap_or_else(|| path.as_str().to_string());
+        match DeviceProxy::builder(connection).path(path.clone()) {
+            Ok(builder) => match builder.build().await {
+                Ok(device) => match device.disconnect().await {
+                    Ok(()) => {
+                        info!("bluetooth: {name} stands aside while the phone plays");
+                        quieted.push(path);
+                    }
+                    Err(err) => warn!("bluetooth: {name} would not stand aside: {err}"),
+                },
+                Err(err) => warn!("bluetooth: cannot reach {name}: {err}"),
+            },
+            Err(err) => warn!("bluetooth: cannot reach {name}: {err}"),
+        }
+    }
+    quieted
+}
+
+/// Call back whatever stood aside.
+async fn wake_the_radio(connection: &Connection, quieted: &[OwnedObjectPath]) {
+    for path in quieted {
+        let Ok(builder) = DeviceProxy::builder(connection).path(path.clone()) else {
+            continue;
+        };
+        let Ok(device) = builder.build().await else {
+            continue;
+        };
+        match device.connect().await {
+            Ok(()) => info!("bluetooth: {} is back", path.as_str()),
+            // A remote that is asleep answers no call; it comes back on its own when a key is
+            // pressed, which is the whole reason this is acceptable.
+            Err(err) => debug!("bluetooth: {} did not answer: {err}", path.as_str()),
+        }
+    }
 }
 
 /// Call a paired phone that is not connected.
