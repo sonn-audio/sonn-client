@@ -33,6 +33,9 @@ use tracing::{debug, info, warn};
 
 const DEFAULT_MENU_POLL_MS: u64 = 10_000;
 const DEFAULT_VOLUME_STEP: u8 = 4;
+/// How long to leave a remote alone between calls. See [`refresh_remotes`].
+const CALL_COOLDOWN: Duration = Duration::from_secs(60);
+
 /// How long to wait before offering the remote's service to bluez again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
@@ -77,13 +80,45 @@ impl BeoremoteConfig {
 /// The paired remotes, as last read from bluez.
 type Remotes = Arc<std::sync::Mutex<Vec<crate::models::PairedRemote>>>;
 
-/// Read the paired list again. Quiet on failure: bluez being briefly unavailable is the same state
-/// as having no remotes, and the next tick asks again.
-async fn refresh_remotes(remotes: &Remotes) {
+/// Read the paired list again, and call back anything that has wandered off.
+///
+/// Quiet on failure: bluez being briefly unavailable is the same state as having no remotes, and
+/// the next tick asks again.
+///
+/// The calling back is not optional politeness. A remote sleeps between key presses and wakes with
+/// *undirected* advertisements, which the kernel ignores for a device it already knows -- it only
+/// answers directed ones. B&O patch their own BlueZ to make this one device an exception; with a
+/// stock daemon the room has to reach out instead, which is the same thing this client does for a
+/// phone that has wandered off.
+async fn refresh_remotes(
+    remotes: &Remotes,
+    called: &mut std::collections::HashMap<String, std::time::Instant>,
+) {
     let Ok(connection) = zbus::Connection::system().await else {
         return;
     };
     let found = crate::pairing::paired_remotes(&connection).await;
+    for remote in &found {
+        if remote.connected {
+            // It is here; the next disconnect deserves a fresh call rather than the tail of an old
+            // cooldown.
+            called.remove(&remote.address);
+            continue;
+        }
+        // Once a minute at most.
+        //
+        // A remote runs on a coin cell and it decides when to sleep -- staying connected is the
+        // most expensive thing it can do, and a room that calls back the instant it hangs up is
+        // arguing with its power management. The call is cheap for the remote (it only lands while
+        // it is already advertising) but the link it opens is not, so it is offered rarely.
+        let due = called
+            .get(&remote.address)
+            .is_none_or(|last| last.elapsed() >= CALL_COOLDOWN);
+        if due {
+            called.insert(remote.address.clone(), std::time::Instant::now());
+            crate::pairing::call_remote(&connection, &remote.address).await;
+        }
+    }
     if let Ok(mut slot) = remotes.lock() {
         *slot = found;
     }
@@ -104,6 +139,8 @@ pub async fn run(
     // Which remotes are paired changes when somebody pairs or forgets one, so it is read on the menu
     // poll rather than on every report -- the answer costs a walk over every bluez object.
     let remotes: Remotes = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut called: std::collections::HashMap<String, std::time::Instant> =
+        std::collections::HashMap::new();
 
     // Keys come from the kernel's input devices: on a stock BlueZ the remote is an ordinary HID
     // peripheral, and there is no vendor socket in the path at all.
@@ -117,7 +154,7 @@ pub async fn run(
     ));
 
     loop {
-        refresh_remotes(&remotes).await;
+        refresh_remotes(&remotes, &mut called).await;
         statuses.set_beoremote(Some(BeoremoteStatusReport {
             state: "waiting".to_string(),
             zone_id: Some(config.zone_id),
@@ -127,7 +164,16 @@ pub async fn run(
             last_error: None,
         }));
 
-        match serve_remote(&config, &statuses, &volume_tx, &hid_connected, &remotes).await {
+        match serve_remote(
+            &config,
+            &statuses,
+            &volume_tx,
+            &hid_connected,
+            &remotes,
+            &mut called,
+        )
+        .await
+        {
             Ok(()) => info!("beoremote service unregistered"),
             Err(err) => {
                 // Not being able to connect is the normal state on a device without the patched
@@ -154,6 +200,7 @@ async fn serve_remote(
     volume_tx: &mpsc::Sender<VolumeRequest>,
     hid_connected: &Arc<AtomicBool>,
     remotes: &Remotes,
+    called: &mut std::collections::HashMap<String, std::time::Instant>,
 ) -> Result<()> {
     let api = BeoremoteApi::new(&config.api_base_url, config.zone_id)?;
     // Room for a burst of writes: the remote sends a selection and its follow-ups back to back, and
@@ -194,7 +241,7 @@ async fn serve_remote(
                 return Ok(());
             }
             _ = menu_poll.tick() => {
-                refresh_remotes(remotes).await;
+                refresh_remotes(remotes, called).await;
                 // Re-read every tick and only republish on a real change: the remote is not
                 // disturbed for nothing, and a new favourite still shows up within one interval.
                 let menu = match api.menu().await {

@@ -445,6 +445,25 @@ pub async fn paired_remotes(connection: &Connection) -> Vec<PairedRemote> {
     remotes
 }
 
+/// Ask a paired remote to come back.
+///
+/// Costs nothing when it is asleep or out of range -- bluez answers "not available" and the next
+/// tick tries again -- and it is the only way a remote that wakes with undirected advertisements
+/// reaches a stock daemon at all.
+pub async fn call_remote(connection: &Connection, address: &str) {
+    let path = format!("/org/bluez/hci0/dev_{}", address.replace(':', "_"));
+    let Ok(builder) = DeviceProxy::builder(connection).path(path) else {
+        return;
+    };
+    let Ok(device) = builder.build().await else {
+        return;
+    };
+    match device.connect().await {
+        Ok(()) => info!("remote {address} is back"),
+        Err(err) => debug!("remote {address} did not answer: {err}"),
+    }
+}
+
 /// Forget one remote, so a replacement can take its place.
 pub async fn forget_remote(address: &str) -> Result<()> {
     let connection = Connection::system()
