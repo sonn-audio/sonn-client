@@ -1,3 +1,21 @@
+# [1.7.0](https://github.com/sonn-audio/sonn-client/compare/v1.6.0...v1.7.0) (2026-08-13)
+
+
+### Bug Fixes
+
+* **pairing:** a new remote does not unpair the old one ([6ad13c7](https://github.com/sonn-audio/sonn-client/commit/6ad13c792f00ed42c886c37f12e2fa7f7629b99d))
+* **pairing:** one pairing window at a time ([f6311cb](https://github.com/sonn-audio/sonn-client/commit/f6311cb97bed4bcf40ccedab284a528db7f6710e))
+* **pairing:** what a Beoremote Essence needs ([ac51fd2](https://github.com/sonn-audio/sonn-client/commit/ac51fd299bfc7db8eb03cb603bda96017ab125a5))
+* **remote:** notice a remote that is only there for a second ([3ed65a2](https://github.com/sonn-audio/sonn-client/commit/3ed65a29f3d3e2ea908fcab7bcc9cdbae99cedc4))
+* **remote:** report the paired list on every poll, not only on republish ([3916a78](https://github.com/sonn-audio/sonn-client/commit/3916a7811befefed84ed9bbb9f3988794ed34354))
+
+
+### Features
+
+* **remote:** call a paired remote back when it wanders off ([6bee4af](https://github.com/sonn-audio/sonn-client/commit/6bee4af1e7619537f6879c0aa6cde30b1d61d02f))
+* **remote:** read the keys a Beoremote Essence sends ([c383f78](https://github.com/sonn-audio/sonn-client/commit/c383f786744a5b4efc94207150069f56421b7839))
+* **remote:** say which model a paired remote is ([c285d37](https://github.com/sonn-audio/sonn-client/commit/c285d3790c5bccc895634024fb2d49f24d6b7b4b))
+
 # [1.6.0](https://github.com/sonn-audio/sonn-client/compare/v1.5.0...v1.6.0) (2026-08-13)
 
 
