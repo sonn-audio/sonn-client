@@ -328,6 +328,13 @@ pub struct DesiredBluetooth {
     /// Whether the phone's transport keys and its metadata are welcome.
     #[serde(default)]
     pub control: Option<bool>,
+    /// Sendspin `client_id` the decoded audio is sent under.
+    ///
+    /// The server names it because the server is the end that has to recognise it: a phone's audio
+    /// arrives here as an ordinary source, and something at the far end has to know which room it
+    /// belongs to.
+    #[serde(default)]
+    pub client_id: Option<String>,
 }
 
 impl DesiredConfig {

@@ -207,6 +207,7 @@ async fn run() -> Result<()> {
                 statuses: statuses.clone(),
                 fallback_volume_hook: config.volume_hook.clone(),
                 server_base_url: api.base_url().to_string(),
+                device_id: config.device_id.clone(),
                 bluetooth_commands: bluetooth_commands.clone(),
             },
             stop_rx,
@@ -388,7 +389,7 @@ async fn status_loop(
                 // Transport for the gear on an input goes to that input's own hook, so the script
                 // that speaks to a BeoSound is configured with the input rather than with the box.
                 for command in &desired.source_commands {
-                    run_source_command(&desired, command).await;
+                    run_source_command(&desired, command, &bluetooth_commands).await;
                 }
                 if desired_tx.send(desired).is_err() {
                     // Nobody left to act on it.
@@ -495,7 +496,29 @@ async fn handle_builtin_command(
 ///
 /// Silence here is a command that reaches nothing, so a source without a hook says so once rather
 /// than leaving someone pressing a button that is quietly discarded.
-async fn run_source_command(desired: &DesiredConfig, command: &SourceCommand) {
+async fn run_source_command(
+    desired: &DesiredConfig,
+    command: &SourceCommand,
+    bluetooth: &bluetooth::CommandBus,
+) {
+    // Bluetooth first: its input has no hook and no capture device, because the thing to command is
+    // the phone, and AVRCP is the wire for it.
+    if desired
+        .bluetooth
+        .as_ref()
+        .and_then(|entry| entry.client_id.as_deref())
+        .is_some_and(|client_id| client_id == command.client_id)
+    {
+        let Some(control) = bluetooth::PlayerControl::parse(&command.command) else {
+            warn!("a phone has no {} key", command.command);
+            return;
+        };
+        info!("bluetooth: {} on the phone", command.command);
+        if !bluetooth.send(bluetooth::Command::Control(control)) {
+            warn!("bluetooth: {} went nowhere; the radio is not running", command.command);
+        }
+        return;
+    }
     let Some(source) = desired
         .sources
         .iter()
@@ -584,7 +607,9 @@ async fn run_bluetooth(name: Option<String>, window: Option<String>) -> Result<(
         discoverable: std::time::Duration::from_secs(seconds),
         pin: None,
         control: true,
-        api_base_url: String::new(),
+        // No server in this mode: the radio is exercised, the audio has nowhere to go.
+        server_url: None,
+        client_id: String::new(),
     };
     println!(
         "Findable as \"{}\" for {}s. Pair from a phone; ctrl-c to stop.",

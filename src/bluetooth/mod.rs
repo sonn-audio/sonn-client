@@ -19,6 +19,7 @@
 //! Deliberately *not* here: restarting bluetoothd. A remote whose link is cut that way stops
 //! advertising until it is factory reset, which cost an evening once.
 
+mod decode;
 mod endpoint;
 mod metadata;
 mod transport;
@@ -130,16 +131,34 @@ pub struct BluetoothConfig {
     pub discoverable: Duration,
     pub pin: Option<String>,
     pub control: bool,
-    pub api_base_url: String,
+    /// Where the decoded audio goes, and under which name the server knows it.
+    ///
+    /// The audio leaves here as an ordinary sendspin source, so a phone in a room is a line input
+    /// as far as everything downstream is concerned.
+    pub server_url: Option<String>,
+    pub client_id: String,
 }
 
 impl BluetoothConfig {
-    pub fn from_desired(desired: &DesiredBluetooth, fallback_base_url: &str) -> Option<Self> {
+    pub fn from_desired(
+        desired: &DesiredBluetooth,
+        server_url: Option<&str>,
+        device_id: &str,
+    ) -> Option<Self> {
         if desired.enabled != Some(true) {
             return None;
         }
         let zone_id = desired.zone_id?;
         Some(Self {
+            server_url: server_url.map(str::to_string),
+            // The server names it; falling back keeps a hand-run client working, and the two
+            // spellings agree because both are this device's id with the same suffix.
+            client_id: desired
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map_or_else(|| format!("{device_id}-bt"), str::to_string),
             zone_id,
             name: desired
                 .name
@@ -151,7 +170,6 @@ impl BluetoothConfig {
                 .unwrap_or(DEFAULT_DISCOVERABLE),
             pin: desired.pin.clone().filter(|pin| !pin.trim().is_empty()),
             control: desired.control.unwrap_or(true),
-            api_base_url: fallback_base_url.to_string(),
         })
     }
 
@@ -199,6 +217,11 @@ pub enum Command {
     Discoverable,
     /// Forget one phone, by address.
     Forget(String),
+    /// Press a transport key on the phone: what the room does, the phone does.
+    ///
+    /// The zone is the remote here. Someone who starts the music from a wall panel or a Beoremote
+    /// expects the phone in their pocket to start playing, and AVRCP is how that is said.
+    Control(metadata::PlayerControl),
 }
 
 /// The agent that answers a phone's pairing questions.
@@ -384,6 +407,7 @@ async fn serve(
     // Which transport is being read, so a phone that reconnects is picked up and one that is already
     // being read is not read twice.
     let mut reading: Option<OwnedObjectPath> = None;
+    let mut streaming: Option<Streaming> = None;
     let mut last_bytes = 0u64;
     // The phone's slider, as last seen. Absolute volume arrives as a property on the transport, and
     // it is the one thing B&O put real work into on this path: a phone whose volume does nothing is
@@ -412,10 +436,25 @@ async fn serve(
                         }
                     }
                     Some(Command::Forget(address)) => forget(&connection, &adapter, &address).await,
+                    Some(Command::Control(control)) => {
+                        if !config.control {
+                            debug!("bluetooth: {control:?} ignored; this zone does not drive the phone");
+                        } else if let Err(err) = metadata::control(&connection, control).await {
+                            warn!("bluetooth: {control:?} did not reach the phone: {err:#}");
+                        }
+                    }
                 }
             }
             _ = poll.tick() => {
-                follow_stream(&connection, &endpoint, &counters, &mut reading).await;
+                follow_stream(
+                    &connection,
+                    &endpoint,
+                    config,
+                    &counters,
+                    &mut reading,
+                    &mut streaming,
+                )
+                .await;
                 follow_volume(&connection, &endpoint, config, volume_tx, &mut last_volume).await;
                 let mut report = inspect(&connection, &adapter, config, &endpoint).await;
                 let stream = StreamReport {
@@ -484,6 +523,22 @@ async fn follow_volume(
         .await;
 }
 
+/// One phone's audio, from the moment it starts until it stops.
+///
+/// The decoder and the source live and die together with the stream: a phone that stops playing
+/// releases the transport, ffmpeg is closed, and the source ends -- which is what tells the server
+/// the room's Bluetooth input has gone quiet.
+struct Streaming {
+    decoder: decode::Decoder,
+    source: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Streaming {
+    fn drop(&mut self) {
+        self.source.abort();
+    }
+}
+
 /// Take the socket as soon as a phone starts playing, and let it go when it stops.
 ///
 /// bluez only hands the socket over while the transport is `active`, and acquiring it twice is an
@@ -491,11 +546,18 @@ async fn follow_volume(
 async fn follow_stream(
     connection: &Connection,
     endpoint: &A2dpEndpoint,
+    config: &BluetoothConfig,
     counters: &std::sync::Arc<transport::StreamCounters>,
     reading: &mut Option<OwnedObjectPath>,
+    streaming: &mut Option<Streaming>,
 ) {
-    let Some(path) = endpoint.transport().path else {
-        // The phone disconnected; the reader ends by itself when the socket closes.
+    let transport_state = endpoint.transport();
+    let Some(path) = transport_state.path else {
+        // The phone disconnected or stopped: close the decoder and end the source, which is what
+        // tells the server this input has gone quiet.
+        if streaming.take().is_some() {
+            info!("bluetooth: the stream ended");
+        }
         *reading = None;
         return;
     };
@@ -505,13 +567,40 @@ async fn follow_stream(
 
     match transport::acquire(connection, &path).await {
         Ok((fd, read_mtu)) => {
-            info!("bluetooth: taking the stream on {}", path.as_str());
+            info!(
+                "bluetooth: taking the stream on {} ({} Hz, {}ch, bitpool {})",
+                path.as_str(),
+                transport_state.sample_rate,
+                transport_state.channels,
+                transport_state.bitpool
+            );
             *reading = Some(path);
+
+            let sample_rate = if transport_state.sample_rate > 0 {
+                transport_state.sample_rate
+            } else {
+                48_000
+            };
+            let channels = if transport_state.channels > 0 {
+                transport_state.channels
+            } else {
+                2
+            };
+            let started = match start_source(config, sample_rate, channels) {
+                Ok(started) => started,
+                Err(err) => {
+                    warn!("bluetooth: no audio path for this stream: {err:#}");
+                    return;
+                }
+            };
+            let frames = started.decoder.frames.clone();
+            *streaming = Some(started);
+
             let counters = std::sync::Arc::clone(counters);
             // Its own thread: this is a blocking socket read that runs for as long as the music
             // does, and it has no business on the runtime that answers D-Bus.
             std::thread::spawn(move || {
-                if let Err(err) = transport::read_stream(fd, read_mtu, counters) {
+                if let Err(err) = transport::read_stream(fd, read_mtu, counters, Some(frames)) {
                     warn!("bluetooth: the stream ended: {err:#}");
                 }
             });
@@ -519,6 +608,43 @@ async fn follow_stream(
         // Not yet playing is the normal case between "connected" and "pressed play".
         Err(err) => debug!("bluetooth: the stream is not ready: {err:#}"),
     }
+}
+
+/// Start the decoder and the source that carries its audio to the server.
+fn start_source(config: &BluetoothConfig, sample_rate: u32, channels: u8) -> Result<Streaming> {
+    let (decoder, pcm) = decode::spawn("sbc", sample_rate, channels)?;
+    let server_url = config
+        .server_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("no sendspin server to send this to"))?;
+
+    let mut source_config = sendspin::source::SourceConfig::new(
+        config.client_id.clone(),
+        format!("{} Bluetooth", config.name),
+    );
+    // PCM, because that is what the protocol names -- see the note in `decode`.
+    source_config.codec = "pcm".to_string();
+    source_config.sample_rate = sample_rate;
+    source_config.channels = channels;
+    source_config.bit_depth = 16;
+    // A phone's audio is present exactly while it is streaming, which the transport already says;
+    // there is no silence to sense.
+    source_config.line_sense = false;
+
+    let source = sendspin::source::Source::with_frames(source_config, pcm);
+    let handle = tokio::spawn(async move {
+        if let Err(err) = source
+            .run_outbound(&server_url, Some(Duration::from_secs(2)))
+            .await
+        {
+            warn!("bluetooth: the audio source stopped: {err}");
+        }
+    });
+
+    Ok(Streaming {
+        decoder,
+        source: handle,
+    })
 }
 
 /// What the adapter and the phones around it are doing.
@@ -783,14 +909,14 @@ mod tests {
             zone_id: Some(3),
             ..Default::default()
         };
-        assert!(BluetoothConfig::from_desired(&off, "http://server").is_none());
+        assert!(BluetoothConfig::from_desired(&off, None, "dev").is_none());
 
         // Enabled but nameless: a zone id is what makes it mean anything.
         let no_zone = DesiredBluetooth {
             enabled: Some(true),
             ..Default::default()
         };
-        assert!(BluetoothConfig::from_desired(&no_zone, "http://server").is_none());
+        assert!(BluetoothConfig::from_desired(&no_zone, None, "dev").is_none());
     }
 
     #[test]
@@ -802,8 +928,9 @@ mod tests {
             discoverable_seconds: Some(45),
             pin: Some("  ".to_string()),
             control: None,
+            client_id: None,
         };
-        let config = BluetoothConfig::from_desired(&desired, "http://server").expect("a config");
+        let config = BluetoothConfig::from_desired(&desired, None, "dev").expect("a config");
         assert_eq!(config.name, "Keuken");
         assert_eq!(config.discoverable, Duration::from_secs(45));
         // A pin of spaces is not a pin; it would otherwise turn every pairing into a passkey dance.
@@ -829,7 +956,7 @@ mod tests {
             ..base.clone()
         };
         let key = |desired: &DesiredBluetooth| {
-            BluetoothConfig::from_desired(desired, "http://server")
+            BluetoothConfig::from_desired(desired, None, "dev")
                 .expect("a config")
                 .restart_key()
         };

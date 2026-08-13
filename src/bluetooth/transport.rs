@@ -80,7 +80,12 @@ pub fn payload(packet: &[u8]) -> Option<Payload<'_>> {
 ///
 /// The socket is a sequenced-packet one, so every read is exactly one RTP packet -- there is no
 /// framing to do and a short read is a packet, not a fragment.
-pub fn read_stream(fd: OwnedFd, read_mtu: u16, counters: Arc<StreamCounters>) -> Result<()> {
+pub fn read_stream(
+    fd: OwnedFd,
+    read_mtu: u16,
+    counters: Arc<StreamCounters>,
+    frames: Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>,
+) -> Result<()> {
     let mut buffer = vec![0u8; usize::from(read_mtu).max(1024)];
     let raw = fd.as_raw_fd();
     // bluez hands the socket over non-blocking, and this reader has a thread of its own precisely so
@@ -119,6 +124,14 @@ pub fn read_stream(fd: OwnedFd, read_mtu: u16, counters: Arc<StreamCounters>) ->
                         counters
                             .frames
                             .fetch_add(u64::from(payload.frames), Ordering::Relaxed);
+                        if let Some(frames) = frames.as_ref() {
+                            // The decoder going away is the stream ending, not an error to shout
+                            // about: it is dropped when the phone stops.
+                            if frames.send(payload.data.to_vec()).is_err() {
+                                debug!("bluetooth: nothing is decoding any more");
+                                return Ok(());
+                            }
+                        }
                     }
                     None => warn!("bluetooth: a packet of {} bytes carried no audio", packet.len()),
                 }

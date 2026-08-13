@@ -83,6 +83,9 @@ pub struct SupervisorContext {
     /// Base URL of the server we registered with, for the parts of the beoremote bridge that talk
     /// HTTP rather than Sendspin.
     pub server_base_url: String,
+    /// This device's own id, which the Bluetooth input's client id is derived from when the server
+    /// names none.
+    pub device_id: String,
     /// Where an operator's Bluetooth commands are handed in. Filled when the radio starts for a
     /// zone and cleared when it stops, so a command sent while it is off says so instead of
     /// disappearing.
@@ -478,8 +481,6 @@ fn reconcile_adapter_name(desired: &DesiredConfig, current: &mut Option<String>)
 struct RunningBluetooth {
     key: String,
     handle: tokio::task::JoinHandle<()>,
-    /// Where an operator's commands go: open the pairing window, forget a phone.
-    commands: mpsc::Sender<bluetooth::Command>,
 }
 
 fn reconcile_bluetooth(
@@ -491,7 +492,9 @@ fn reconcile_bluetooth(
     let wanted = desired
         .bluetooth
         .as_ref()
-        .and_then(|entry| BluetoothConfig::from_desired(entry, &ctx.server_base_url));
+        .and_then(|entry| {
+            BluetoothConfig::from_desired(entry, sendspin_url(desired), &ctx.device_id)
+        });
 
     match (&wanted, running.as_ref()) {
         (Some(config), Some(entry)) if entry.key == config.restart_key() => return,
@@ -520,12 +523,8 @@ fn reconcile_bluetooth(
     let handle = tokio::spawn(async move {
         bluetooth::run(config, statuses, receiver, volume_tx).await;
     });
-    ctx.bluetooth_commands.set(Some(commands.clone()));
-    *running = Some(RunningBluetooth {
-        key,
-        handle,
-        commands,
-    });
+    ctx.bluetooth_commands.set(Some(commands));
+    *running = Some(RunningBluetooth { key, handle });
 }
 
 fn stop_bluetooth(running: &mut Option<RunningBluetooth>) {

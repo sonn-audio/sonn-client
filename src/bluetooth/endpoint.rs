@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 use zbus::{interface, proxy, Connection};
 
