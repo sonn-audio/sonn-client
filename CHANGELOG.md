@@ -1,3 +1,35 @@
+# [1.5.0](https://github.com/sonn-audio/sonn-client/compare/v1.4.2...v1.5.0) (2026-08-13)
+
+
+### Bug Fixes
+
+* **beoremote:** a database bluez lays out the way we wrote it ([69d6e57](https://github.com/sonn-audio/sonn-client/commit/69d6e579ddf5896d14402e6adfe254a9ce4090fb))
+* **beoremote:** an empty favorite is an answer, not a failure ([b71ae89](https://github.com/sonn-audio/sonn-client/commit/b71ae890e30d25b1e429a407567fa2195364d26b))
+* **beoremote:** rebuild a link that was up before the bridge ([12e6191](https://github.com/sonn-audio/sonn-client/commit/12e619157ae6816a823d8802d6eb8cc376737a74))
+* **beoremote:** reopen the remote's input devices, and say what a key did ([12b1d56](https://github.com/sonn-audio/sonn-client/commit/12b1d56ef6214528f965beaa124a51f03ed1759d))
+* **beoremote:** take the writes the remote actually sends, and keep our handles ([4125c31](https://github.com/sonn-audio/sonn-client/commit/4125c31e4667178e51860e75f032202814916a1c))
+* **beoremote:** the same handles on every start ([56264a0](https://github.com/sonn-audio/sonn-client/commit/56264a048080fe4d9589a24cc168eb227d27c103))
+* **bluetooth:** a remote is not a phone ([cb3e6ee](https://github.com/sonn-audio/sonn-client/commit/cb3e6ee1117ed850ddb31c61aecaae2d4dbc23ca))
+* **bluetooth:** hand the audio on the way it was played ([b939ac9](https://github.com/sonn-audio/sonn-client/commit/b939ac9a09aad7d05cdedb98719a3c73c61da2ea))
+* **bluetooth:** keep the phone's audio, once it starts ([8a6a623](https://github.com/sonn-audio/sonn-client/commit/8a6a623aec5a8f0e7270ea769e7493e35fe5d4f7))
+* **bluetooth:** stop tugging at a phone that is simply not playing ([e6911b0](https://github.com/sonn-audio/sonn-client/commit/e6911b0e6c07902e144dff853a1984878ca8febe))
+* **bluetooth:** the phone's clock is the only clock ([f257dc1](https://github.com/sonn-audio/sonn-client/commit/f257dc1de4304bc0f655413fc0f36d843ae25e04))
+* **client:** introduce yourself again to a server that has forgotten you ([ba30668](https://github.com/sonn-audio/sonn-client/commit/ba3066851bbf14a62e30cc01a86296c7dfe1cb3f))
+* **pairing:** hold an agent open for the whole window ([f175066](https://github.com/sonn-audio/sonn-client/commit/f175066f146fce53c75a5886e1a49d170808301b))
+* **pairing:** scan LE-only, retry once, and let the remote finish ([1bf71b4](https://github.com/sonn-audio/sonn-client/commit/1bf71b445fd0b8d51199672a4845cc08c8893258))
+
+
+### Features
+
+* **beoremote:** serve the remote's service ourselves ([c2d624f](https://github.com/sonn-audio/sonn-client/commit/c2d624fef3739a2dcb251f1c0ee6133583ed0333))
+* **bluetooth:** a phone pairs with the client and plays to a zone ([06ea951](https://github.com/sonn-audio/sonn-client/commit/06ea95126b9098d2b0dc64732116a75f152190d6))
+* **bluetooth:** send what a phone plays to the server ([171c7ed](https://github.com/sonn-audio/sonn-client/commit/171c7ede5907e8621a5427677d4a16a63570ddf5))
+* **bluetooth:** the phone's slider is the room's volume ([f52d63b](https://github.com/sonn-audio/sonn-client/commit/f52d63bafbd8a8094c2af2c30f22aef5f0e50055))
+* **bluetooth:** the radio carries the room's name, for everything that reads it ([d9cea28](https://github.com/sonn-audio/sonn-client/commit/d9cea28a024ed26edade3f89b36988634f319c3e))
+* **bluetooth:** the remote stands aside while a phone plays ([7dcc8e5](https://github.com/sonn-audio/sonn-client/commit/7dcc8e5d85452a1c4b1a2081e59c24a18594a3e4))
+* **pairing:** pair-remote takes a window, and never restarts bluetoothd ([7327715](https://github.com/sonn-audio/sonn-client/commit/7327715fab9159c5179d5898ed26b0c4c8a87196))
+* **source:** announce what the hardware can do, not what a form said ([81ab641](https://github.com/sonn-audio/sonn-client/commit/81ab641140f95b394898f00cdf845c62f288cfda))
+
 ## [1.4.2](https://github.com/sonn-audio/sonn-client/compare/v1.4.1...v1.4.2) (2026-08-12)
 
 
