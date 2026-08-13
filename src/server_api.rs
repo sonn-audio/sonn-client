@@ -5,6 +5,14 @@
 
 use crate::models::{ClientRegisterRequest, ClientStatusRequest, DesiredConfig};
 use anyhow::{Context, Result};
+
+/// What a status post came back with.
+pub enum StatusOutcome {
+    /// The state this device should be in.
+    Desired(Box<DesiredConfig>),
+    /// The server does not know this device and wants it to register again.
+    Unknown,
+}
 use reqwest::Client;
 use std::time::Duration;
 
@@ -52,11 +60,16 @@ impl ServerApi {
             .context("parse register response")
     }
 
+    /// Report what this device is doing, and read back what it should be.
+    ///
+    /// [`StatusOutcome::Unknown`] is not a failure: the server keeps what hardware a device has in
+    /// memory, so a server that has restarted is one this device has to introduce itself to again.
+    /// It says so rather than answering with a desired state built on nothing.
     pub async fn post_status(
         &self,
         device_id: &str,
         status: &ClientStatusRequest,
-    ) -> Result<DesiredConfig> {
+    ) -> Result<StatusOutcome> {
         let url = format!(
             "{}{}",
             self.base_url,
@@ -68,12 +81,17 @@ impl ServerApi {
             .json(status)
             .send()
             .await
-            .context("post status")?
+            .context("post status")?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            return Ok(StatusOutcome::Unknown);
+        }
+        let response = response
             .error_for_status()
             .context("status response status")?;
         response
             .json::<DesiredConfig>()
             .await
+            .map(|desired| StatusOutcome::Desired(Box::new(desired)))
             .context("parse status response")
     }
 }

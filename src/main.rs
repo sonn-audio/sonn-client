@@ -41,7 +41,7 @@ use crate::models::{
     ClientCapabilities, ClientRegisterRequest, ClientStatusRequest, DesiredConfig, DeviceCommand,
     OutputDeviceInfo, SourceCommand,
 };
-use crate::server_api::ServerApi;
+use crate::server_api::{ServerApi, StatusOutcome};
 use crate::supervisor::SupervisorContext;
 
 const DEFAULT_POLL_MS: u64 = 5_000;
@@ -363,7 +363,19 @@ async fn status_loop(
         };
 
         match api.post_status(&device_id, &request).await {
-            Ok(desired) => {
+            Ok(StatusOutcome::Unknown) => {
+                // A server that has forgotten this device knows nothing about its sound cards, so
+                // what it hands back would be a desired state built on a blank. Registering again
+                // is the whole fix, and it is what the outer loop does when this returns.
+                warn!(
+                    "{} does not know this device; registering again",
+                    api.base_url()
+                );
+                let _ = stop_tx.send(true);
+                return;
+            }
+            Ok(StatusOutcome::Desired(desired)) => {
+                let desired = *desired;
                 failures = 0;
                 reported_outputs = outputs_hash;
                 reported_inputs = inputs_hash;
