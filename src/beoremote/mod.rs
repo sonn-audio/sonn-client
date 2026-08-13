@@ -242,6 +242,18 @@ async fn serve_remote(
             }
             _ = menu_poll.tick() => {
                 refresh_remotes(remotes, called).await;
+                // Report it as well, not just cache it. The list is what the admin screen reads,
+                // and it changes without the menu changing: pairing or forgetting a remote leaves
+                // the menu identical, so a report only written on republish kept saying "no remote
+                // paired" about a remote that was working.
+                statuses.set_beoremote(Some(BeoremoteStatusReport {
+                    state: "connected".to_string(),
+                    zone_id: Some(config.zone_id),
+                    menu_revision: published.revision.clone(),
+                    hid_connected: hid_connected.load(Ordering::Relaxed),
+                    devices: paired(remotes),
+                    last_error: None,
+                }));
                 // Re-read every tick and only republish on a real change: the remote is not
                 // disturbed for nothing, and a new favourite still shows up within one interval.
                 let menu = match api.menu().await {
