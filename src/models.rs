@@ -328,6 +328,10 @@ pub struct DesiredBluetooth {
     /// Whether the phone's transport keys and its metadata are welcome.
     #[serde(default)]
     pub control: Option<bool>,
+    /// What to decode to, in Hz. The room's output rate, so the server never has to resample a
+    /// stream that has no clock of its own.
+    #[serde(default)]
+    pub sample_rate: Option<u32>,
     /// Sendspin `client_id` the decoded audio is sent under.
     ///
     /// The server names it because the server is the end that has to recognise it: a phone's audio

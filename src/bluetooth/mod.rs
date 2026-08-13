@@ -137,6 +137,8 @@ pub struct BluetoothConfig {
     /// as far as everything downstream is concerned.
     pub server_url: Option<String>,
     pub client_id: String,
+    /// The rate to decode to: the room's output rate, so nothing downstream has to convert.
+    pub sample_rate: u32,
 }
 
 impl BluetoothConfig {
@@ -153,6 +155,9 @@ impl BluetoothConfig {
             server_url: server_url.map(str::to_string),
             // The server names it; falling back keeps a hand-run client working, and the two
             // spellings agree because both are this device's id with the same suffix.
+            // 48 kHz unless the server says otherwise: it is what every output here runs at, and a
+            // phone that sends it already is then carried untouched.
+            sample_rate: desired.sample_rate.filter(|rate| *rate > 0).unwrap_or(48_000),
             client_id: desired
                 .client_id
                 .as_deref()
@@ -556,7 +561,7 @@ async fn follow_stream(
     streaming: &mut Option<Streaming>,
 ) {
     let transport_state = endpoint.transport();
-    let Some(path) = transport_state.path else {
+    let Some(path) = transport_state.path.clone() else {
         // The phone disconnected or stopped: close the decoder and end the source, which is what
         // tells the server this input has gone quiet.
         if streaming.take().is_some() {
@@ -565,6 +570,16 @@ async fn follow_stream(
         *reading = None;
         return;
     };
+    // Playing, about to play, or stopped: bluez keeps the transport in place across a pause, so its
+    // state is the only thing that says whether there is still music.
+    let state = transport::state(connection, &path).await;
+    if state != "active" && state != "pending" {
+        if streaming.take().is_some() {
+            info!("bluetooth: the phone stopped");
+        }
+        *reading = None;
+        return;
+    }
     if reading.as_ref() == Some(&path) {
         return;
     }
@@ -580,11 +595,14 @@ async fn follow_stream(
             );
             *reading = Some(path);
 
-            let sample_rate = if transport_state.sample_rate > 0 {
-                transport_state.sample_rate
-            } else {
-                48_000
-            };
+            // Decoded to the rate the server wants, not the rate the phone sends.
+            //
+            // A phone sends 44.1 kHz and outputs run at 48. Someone has to convert, and it is much
+            // better done here: ffmpeg is already decoding this stream sample by sample as it
+            // arrives, so the conversion rides along with it. Handing 44.1 kHz to the server instead
+            // puts a resampler in the middle of a live stream that has no clock of its own, and that
+            // is audible -- a tone that is clean at 48 kHz stutters at 44.1.
+            let sample_rate = config.sample_rate;
             let channels = if transport_state.channels > 0 {
                 transport_state.channels
             } else {
@@ -684,6 +702,18 @@ async fn inspect(
                     continue;
                 }
                 let connected = bool_property(properties, "Connected").unwrap_or(false);
+                // Nothing is connected, so nothing can play: call the phone.
+                //
+                // This is the half that was missing, and the half that made it feel unreliable. A
+                // phone's own list only offers a device it is already connected to, so a room whose
+                // speaker never calls can only be reached by pairing again -- which works, and which
+                // is exactly what "it is not stable" means. A B&O box calls its last phone; so does
+                // this. It is a paired, trusted device and the call costs nothing when it is out of
+                // range or busy.
+                if !connected && due(asked, &path) {
+                    asked.insert(path.as_str().to_string(), std::time::Instant::now());
+                    call(connection, &path).await;
+                }
                 // A phone that is here but not sending is one whose audio session went with a
                 // restart of this process: the link survives, the A2DP session does not, and iOS
                 // does not rebuild it by itself. So it is asked -- but rarely.
@@ -692,10 +722,7 @@ async fn inspect(
                 // and goes on not playing anything, and because iOS drops the profile again straight
                 // afterwards, which looks exactly like a phone that needs asking. Asking every poll
                 // turned into a speaker tugging at someone's sleeve three times a second.
-                let due = asked
-                    .get(path.as_str())
-                    .is_none_or(|last| last.elapsed() >= RECONNECT_COOLDOWN);
-                if connected && streaming.is_none() && due {
+                if connected && streaming.is_none() && due(asked, &path) {
                     asked.insert(path.as_str().to_string(), std::time::Instant::now());
                     reconnect_audio(connection, &path).await;
                 }
@@ -727,8 +754,34 @@ async fn inspect(
     report
 }
 
-/// How long to leave a phone alone between asking it for its audio.
+/// How long to leave a phone alone between calls.
 const RECONNECT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// Whether this phone may be reached for again.
+fn due(
+    asked: &std::collections::HashMap<String, std::time::Instant>,
+    path: &OwnedObjectPath,
+) -> bool {
+    asked
+        .get(path.as_str())
+        .is_none_or(|last| last.elapsed() >= RECONNECT_COOLDOWN)
+}
+
+/// Call a paired phone that is not connected.
+async fn call(connection: &Connection, path: &OwnedObjectPath) {
+    let Ok(builder) = DeviceProxy::builder(connection).path(path.clone()) else {
+        return;
+    };
+    let Ok(device) = builder.build().await else {
+        return;
+    };
+    match device.connect().await {
+        Ok(()) => info!("bluetooth: connected to {}", path.as_str()),
+        // Out of range, switched off, or busy with someone else: all normal, none worth shouting
+        // about every minute.
+        Err(err) => debug!("bluetooth: {} did not answer: {err}", path.as_str()),
+    }
+}
 
 /// Ask a connected phone for its audio again.
 async fn reconnect_audio(connection: &Connection, path: &OwnedObjectPath) {
@@ -946,6 +999,7 @@ mod tests {
             pin: Some("  ".to_string()),
             control: None,
             client_id: None,
+            sample_rate: None,
         };
         let config = BluetoothConfig::from_desired(&desired, None, "dev").expect("a config");
         assert_eq!(config.name, "Keuken");

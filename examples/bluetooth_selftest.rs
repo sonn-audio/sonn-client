@@ -21,14 +21,19 @@ async fn main() {
     let client_id = args.next().unwrap_or_else(|| "selftest-bt".to_string());
     let seconds: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(5);
     let tone: f32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
-
-    let sample_rate = 48_000u32;
+    // The rate matters as much as the audio: a phone sends 44.1 kHz and the server has to carry that
+    // to a 48 kHz output for as long as the music lasts. Sending 48 kHz here would test everything
+    // except the conversion.
+    let sample_rate: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(48_000);
     let channels = 2usize;
     let (frames_tx, frames_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    // A tenth of a second at a time, paced in real time: a source that dumps five seconds at once
-    // is not the thing being tested.
+    // A tenth of a second at a time, paced against a fixed clock rather than by sleeping. A sleep is
+    // always a little longer than asked, and a producer that runs one percent slow starves the room
+    // a few seconds in -- which sounds exactly like a stream that is broken, and is not.
     let chunk_frames = (sample_rate / 10) as usize;
+    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
     tokio::spawn(async move {
         let mut phase = 0f32;
         for _ in 0..(seconds * 10) {
@@ -47,7 +52,7 @@ async fn main() {
             if frames_tx.send(chunk).is_err() {
                 return;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tick.tick().await;
         }
         println!("selftest: audio finished; closing the source");
     });
@@ -59,7 +64,7 @@ async fn main() {
     config.bit_depth = 16;
     let source = sendspin::source::Source::with_frames(config, frames_rx);
 
-    println!("selftest: sending {seconds}s to {url}");
+    println!("selftest: sending {seconds}s of {sample_rate} Hz to {url}");
     match source.run_outbound(&url, None).await {
         Ok(()) => println!("selftest: the session ended"),
         Err(err) => println!("selftest: the session failed: {err}"),

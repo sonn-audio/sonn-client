@@ -75,6 +75,7 @@ pub(super) trait MediaTransport {
     /// The socket carrying the audio, with the read and write sizes bluez negotiated.
     fn acquire(&self) -> zbus::Result<(zbus::zvariant::OwnedFd, u16, u16)>;
     fn release(&self) -> zbus::Result<()>;
+    /// `idle`, `pending` or `active`: whether the phone is actually sending.
     #[zbus(property)]
     fn state(&self) -> zbus::Result<String>;
     #[zbus(property)]

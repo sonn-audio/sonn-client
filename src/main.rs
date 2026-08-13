@@ -197,6 +197,7 @@ async fn run() -> Result<()> {
             outputs,
             inputs,
             bluetooth_commands.clone(),
+            is_pinned(&config),
         ));
 
         // Returns when the poller gives up on this server (or its sender is dropped), having first
@@ -343,6 +344,8 @@ async fn status_loop(
     initial_outputs: Vec<OutputDeviceInfo>,
     initial_inputs: Vec<OutputDeviceInfo>,
     bluetooth_commands: bluetooth::CommandBus,
+    // Whether this device was told which server to use, rather than having found one.
+    pinned: bool,
 ) {
     let mut reported_outputs = hash_outputs(&initial_outputs);
     let mut reported_inputs = hash_outputs(&initial_inputs);
@@ -403,6 +406,20 @@ async fn status_loop(
                     failures, MAX_STATUS_FAILURES, err
                 );
                 if failures >= MAX_STATUS_FAILURES {
+                    if pinned {
+                        // There is nothing to rediscover, so there is nothing to gain by tearing
+                        // the device down: everything it runs would be started again from the same
+                        // configuration by the same server. And the cost of tearing down is real --
+                        // the Bluetooth sink disappears, and the phone playing through it drops back
+                        // to its own speaker. A server being restarted should not empty the room.
+                        if failures == MAX_STATUS_FAILURES {
+                            warn!(
+                                "{} is not answering; keeping everything running until it does",
+                                api.base_url()
+                            );
+                        }
+                        continue;
+                    }
                     let _ = stop_tx.send(true);
                     return;
                 }
@@ -610,6 +627,7 @@ async fn run_bluetooth(name: Option<String>, window: Option<String>) -> Result<(
         // No server in this mode: the radio is exercised, the audio has nowhere to go.
         server_url: None,
         client_id: String::new(),
+        sample_rate: 48_000,
     };
     println!(
         "Findable as \"{}\" for {}s. Pair from a phone; ctrl-c to stop.",

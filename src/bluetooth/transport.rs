@@ -169,6 +169,22 @@ unsafe fn libc_recv(fd: i32, buf: *mut u8, len: usize) -> isize {
     libc_recv_raw(fd, buf, len, 0)
 }
 
+/// What bluez says this transport is doing.
+///
+/// A phone that stops playing leaves the transport in place and moves it to `idle`. Watching only
+/// for the transport to disappear therefore misses the most ordinary event there is -- someone
+/// pressing pause -- and leaves the room holding a source that will never carry another sample.
+pub async fn state(connection: &zbus::Connection, path: &zbus::zvariant::OwnedObjectPath) -> String {
+    let Ok(builder) = super::endpoint::MediaTransportProxy::builder(connection).path(path.clone())
+    else {
+        return String::new();
+    };
+    let Ok(transport) = builder.build().await else {
+        return String::new();
+    };
+    transport.state().await.unwrap_or_default()
+}
+
 /// Acquire the socket for a transport that has gone active.
 pub async fn acquire(
     connection: &zbus::Connection,
