@@ -46,6 +46,13 @@ pub struct Config {
     /// `<command> <level 0-100>`. Muted is sent as 0.
     #[serde(default)]
     pub volume_hook: Option<String>,
+    /// The server that last claimed this device, remembered across restarts.
+    ///
+    /// Written by the client, not by hand: it is state, like `device_id`, not a preference. Without
+    /// it a device that reboots while its own server is down is a device with no memory of whose it
+    /// is, and the first server to answer takes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attached_server: Option<String>,
     /// Anything in the file this build does not know.
     ///
     /// Kept rather than rejected, because a config written by a newer client should survive a
@@ -120,6 +127,7 @@ pub fn load_or_create_config() -> Result<(Config, PathBuf)> {
         on_connect: None,
         on_command: None,
         volume_hook: None,
+        attached_server: None,
         unrecognised: BTreeMap::new(),
     };
     let path = write_config(&config)?;
@@ -215,6 +223,22 @@ fn try_write(path: &Path, contents: &str) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     fs::write(path, contents).with_context(|| format!("write {}", path.display()))
+}
+
+/// Remember which server runs this device, so a restart does not forget.
+///
+/// Best effort on purpose: a device that cannot write its config still works, it only loses the
+/// memory of whose it is when it restarts -- which is what every device did before this.
+pub fn remember_server(config: &mut Config, base_url: Option<&str>) {
+    let next = base_url.map(str::to_string);
+    if config.attached_server == next {
+        return;
+    }
+    config.attached_server = next;
+    match write_config(config) {
+        Ok(path) => tracing::debug!("noted the attached server in {}", path.display()),
+        Err(err) => tracing::debug!("could not note the attached server: {err:#}"),
+    }
 }
 
 #[cfg(test)]

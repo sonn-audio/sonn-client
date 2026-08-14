@@ -98,6 +98,15 @@ pub struct ClientRegisterRequest {
     /// Set when announcing to a server that did *not* get this device, so it can let go.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
+    /// The server this device believes runs it, sent to every server it announces to.
+    ///
+    /// Not the same thing as `claimed_by`, which says "I have been given away, let go". This says
+    /// "somebody already has me" -- so a server that has never seen this device does not adopt it
+    /// merely because it happens to be the only one answering. That is what took a speaker away
+    /// from its own server while that server was restarting: for a minute it really was the only
+    /// one on the network, and there is no way to tell that minute from a house with one core.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attached_to: Option<String>,
 }
 
 /// One audioserver this device can see, as it advertised itself.

@@ -109,7 +109,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    let (config, config_path) = config::load_or_create_config()?;
+    let (mut config, config_path) = config::load_or_create_config()?;
     info!(
         "sonn-client {} as {} (config {})",
         env!("CARGO_PKG_VERSION"),
@@ -173,7 +173,7 @@ async fn run() -> Result<()> {
             .collect();
 
         let Some((server, api, desired)) =
-            announce(&candidates, &request, &mut declined, &config).await
+            announce(&candidates, &request, &mut declined, &mut config).await
         else {
             // Nobody has this device: either nothing answered, or every server that did is waiting
             // for somebody to say it is theirs. Announcing again is what keeps it on their screens.
@@ -306,7 +306,7 @@ async fn announce(
     candidates: &[DiscoveredServer],
     request: &ClientRegisterRequest,
     declined: &mut HashMap<String, Instant>,
-    config: &config::Config,
+    config: &mut config::Config,
 ) -> Option<(DiscoveredServer, ServerApi, DesiredConfig)> {
     let mut claimed: Vec<(DiscoveredServer, ServerApi, DesiredConfig)> = Vec::new();
     let mut others: Vec<ServerApi> = Vec::new();
@@ -321,17 +321,25 @@ async fn announce(
                 claimed.push((server.clone(), api, *desired));
             }
             Registration::Accepted(_) => {
-                info!(
-                    "{} can see this device and is waiting for someone to claim it",
-                    server.instance_name
-                );
+                // The server that has been running this device saying it no longer does is the one
+                // way this device is released: somebody moved it, on that server's screen. Anything
+                // else answering the same way is simply not its server.
+                if config.attached_server.as_deref() == Some(api.base_url()) {
+                    info!("{} let this device go", api.base_url());
+                    config::remember_server(config, None);
+                } else {
+                    info!(
+                        "{} can see this device and is waiting for someone to claim it",
+                        server.instance_name
+                    );
+                }
                 others.push(api);
             }
             Registration::NotSupported => {
                 declined.insert(api.base_url().to_string(), Instant::now());
                 // A pinned server is not skipped and discovery is not run, so nothing else would
                 // slow this loop down. Wait before asking the same server the same question.
-                if is_pinned(config) {
+                if is_pinned(&*config) {
                     tokio::time::sleep(DISCOVERY_BACKOFF).await;
                 }
             }
@@ -340,18 +348,31 @@ async fn announce(
     }
 
     if claimed.len() > 1 {
-        // Only an installation from before any of this: two servers that both still have the device
-        // written down. The one that has heard from it most recently wins, and the other is told.
+        // Two servers that both have the device written down -- one of them from an older build, or
+        // from having adopted it while the other was restarting. This device's own answer settles
+        // it: the server it was attached to keeps it. Only when it has no memory of one does the
+        // tie fall back to who heard from it last.
         warn!(
-            "{} servers say they have this device; taking the one that heard from it last",
+            "{} servers say they have this device; keeping the one it belongs to",
             claimed.len()
         );
-        claimed.sort_by(|left, right| right.2.claimed_at.cmp(&left.2.claimed_at));
+        let attached = config.attached_server.clone();
+        claimed.sort_by(|left, right| {
+            let ours = |api: &ServerApi| attached.as_deref() == Some(api.base_url());
+            ours(&right.1)
+                .cmp(&ours(&left.1))
+                .then_with(|| right.2.claimed_at.cmp(&left.2.claimed_at))
+        });
     }
 
     let chosen = claimed
         .first()
         .map(|(server, api, _)| (server.clone(), api.clone()))?;
+    // Written down, so the next announcement can say whose this device is -- to every server,
+    // including after a reboot. Without it, a server that has this device in its config from an
+    // earlier mistake claims it just as loudly as the one actually running it, and which of the two
+    // wins is the order they happened to answer in.
+    config::remember_server(config, Some(chosen.1.base_url()));
     for api in others
         .into_iter()
         .chain(claimed.iter().skip(1).map(|(_, api, _)| api.clone()))
@@ -575,6 +596,7 @@ fn build_register_request(
         // Filled in by the caller, which is the one that knows what it found. See `announce`.
         servers: Vec::new(),
         claimed_by: None,
+        attached_to: config.attached_server.clone(),
     }
 }
 
@@ -1007,6 +1029,7 @@ mod tests {
             on_connect: None,
             on_command: None,
             volume_hook: None,
+            attached_server: None,
             unrecognised: Default::default(),
         };
         assert!(describe_server_preference(&config).contains("no server pinned"));
