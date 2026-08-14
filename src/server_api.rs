@@ -33,10 +33,16 @@ impl ServerApi {
             register_path: register_path.to_string(),
             status_path: status_path.to_string(),
             logs_path: logs_path_for(status_path),
-            // Bounded so a server that accepts the connection and then stalls cannot wedge the
-            // status loop: a missed poll is retried, a hung one never is.
             client: Client::builder()
+                // Bounded so a server that accepts the connection and then stalls cannot wedge the
+                // status loop: a missed poll is retried, a hung one never is.
                 .timeout(Duration::from_secs(10))
+                // Shorter than any sensible server's keep-alive, so we never hand a request to a
+                // connection the other side is closing at that moment. Node's default is five
+                // seconds and this client posts its status every five: the two lined up exactly,
+                // and every few minutes a speaker logged a connection reset for a request that
+                // succeeded on the retry.
+                .pool_idle_timeout(Duration::from_secs(3))
                 .build()
                 .context("build http client")?,
         })
