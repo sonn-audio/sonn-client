@@ -1,3 +1,12 @@
+## [1.9.1](https://github.com/sonn-audio/sonn-client/compare/v1.9.0...v1.9.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* **api:** stop racing the server's keep-alive ([3dce6b4](https://github.com/sonn-audio/sonn-client/commit/3dce6b46587a94045e44f318f662b944d3297dbb))
+* **discovery:** a speaker stays with its own server across a restart ([e451a8b](https://github.com/sonn-audio/sonn-client/commit/e451a8bb074eb8e4df6aad56ad3922d6161b2062))
+* **discovery:** only a person moves a speaker off its own server ([8d76557](https://github.com/sonn-audio/sonn-client/commit/8d76557441a081e7bddc7a9911cb11bb642a7759))
+
 # [1.9.0](https://github.com/sonn-audio/sonn-client/compare/v1.8.0...v1.9.0) (2026-08-13)
 
 
