@@ -271,6 +271,13 @@ pub struct DesiredConfig {
     /// two servers both believing they have it.
     #[serde(default)]
     pub claimed_at: Option<String>,
+    /// Set when a person claimed this device on that server just now.
+    ///
+    /// The one thing that moves a device away from the server it belongs to. Anything else claiming
+    /// is either its own server (fine) or a server that should not have it -- an older build, or one
+    /// that adopted it while its real server was restarting.
+    #[serde(default)]
+    pub claimed_by_hand: bool,
     /// Friendly device name. Only used for logs and as a fallback player name.
     #[serde(default)]
     pub device_name: Option<String>,

@@ -347,6 +347,27 @@ async fn announce(
         }
     }
 
+    // The server this device belongs to is only left behind on purpose: it let go (answered that it
+    // no longer has us, handled above) or somebody claimed this device somewhere else. A server that
+    // simply claims -- an older build, or one that adopted us while ours was restarting -- does not
+    // take it over, and if ours is not answering at all we wait for it rather than walk off.
+    if let Some(attached) = config.attached_server.clone() {
+        let ours_answered = claimed.iter().any(|(_, api, _)| api.base_url() == attached);
+        let by_hand = claimed
+            .iter()
+            .any(|(_, _, desired)| desired.claimed_by_hand);
+        if !ours_answered && !by_hand {
+            if !claimed.is_empty() {
+                info!(
+                    "{} says it has this device, but it belongs to {}; waiting for that one",
+                    claimed[0].1.base_url(),
+                    attached
+                );
+            }
+            return None;
+        }
+    }
+
     if claimed.len() > 1 {
         // Two servers that both have the device written down -- one of them from an older build, or
         // from having adopted it while the other was restarting. This device's own answer settles
@@ -359,8 +380,10 @@ async fn announce(
         let attached = config.attached_server.clone();
         claimed.sort_by(|left, right| {
             let ours = |api: &ServerApi| attached.as_deref() == Some(api.base_url());
+            // Ours first, then whoever a person just picked, then who heard from us last.
             ours(&right.1)
                 .cmp(&ours(&left.1))
+                .then_with(|| right.2.claimed_by_hand.cmp(&left.2.claimed_by_hand))
                 .then_with(|| right.2.claimed_at.cmp(&left.2.claimed_at))
         });
     }
