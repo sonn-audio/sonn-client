@@ -1,3 +1,10 @@
+# [1.10.0](https://github.com/sonn-audio/sonn-client/compare/v1.9.1...v1.10.0) (2026-10-10)
+
+
+### Bug Fixes
+
+* **release:** the Pi 1 / Zero build runs on an ARMv6 core ([0af1ab5](https://github.com/sonn-audio/sonn-client/commit/0af1ab5e205e6b485252d9775cdae0d10992b8c2)), closes [#1](https://github.com/sonn-audio/sonn-client/issues/1)
+
 ## [1.9.1](https://github.com/sonn-audio/sonn-client/compare/v1.9.0...v1.9.1) (2026-08-14)
 
 
