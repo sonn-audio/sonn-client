@@ -29,15 +29,23 @@ passthrough = [
   "CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-L/usr/lib/arm-linux-gnueabihf"
 ]
 
+# Debian's armhf is ARMv7, so /usr/lib/arm-linux-gnueabihf must never be on this target's link path:
+# the linker then takes libc.so from there, and with it a Thumb-2 libc_nonshared.a whose startup code
+# is a SIGILL on a Pi 1 / Zero before main is reached. Only libasound is lifted out into a directory
+# of its own; libc and everything else comes from the image's ARMv6 sysroot. That glibc is older
+# than the one libasound was built against, so its symbols are left for the Pi's own libc to resolve.
 [target.arm-unknown-linux-gnueabihf]
 pre-build = [
   "dpkg --add-architecture armhf",
   "apt-get update",
-  "apt-get install -y libasound2:armhf libasound2-dev:armhf libc6-dev:armhf pkg-config"
+  "apt-get install -y libasound2:armhf libasound2-dev:armhf libc6-dev:armhf pkg-config",
+  "mkdir -p /opt/alsa-armhf/pkgconfig",
+  "cp -P /usr/lib/arm-linux-gnueabihf/libasound.so* /opt/alsa-armhf/",
+  "sed 's|^libdir=.*|libdir=/opt/alsa-armhf|' /usr/lib/arm-linux-gnueabihf/pkgconfig/alsa.pc > /opt/alsa-armhf/pkgconfig/alsa.pc"
 ]
 [target.arm-unknown-linux-gnueabihf.env]
 passthrough = [
-  "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig:/usr/share/pkgconfig",
+  "PKG_CONFIG_PATH=/opt/alsa-armhf/pkgconfig",
   "PKG_CONFIG_ALLOW_CROSS=1",
-  "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-L/usr/lib/arm-linux-gnueabihf"
+  "CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_RUSTFLAGS=-C link-arg=-Wl,--allow-shlib-undefined"
 ]

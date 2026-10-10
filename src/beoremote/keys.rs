@@ -257,7 +257,7 @@ fn spawn_reader(path: PathBuf, model: &'static str, keys: mpsc::Sender<Event>) -
                     break true;
                 }
             };
-            for chunk in buffer[..read].chunks_exact(EVENT_SIZE) {
+            for chunk in buffer[..read].as_chunks::<EVENT_SIZE>().0 {
                 let event: libc_input_event =
                     unsafe { std::ptr::read_unaligned(chunk.as_ptr().cast()) };
                 if event.kind != EV_KEY || event.value != KEY_PRESS {

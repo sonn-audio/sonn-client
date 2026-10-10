@@ -93,6 +93,19 @@ jobs:
         run: cargo install cross --locked
       - name: Build
         run: cross build --release --target ${{ matrix.target }}
+      # The image's ARMv6 sysroot has glibc 2.17; Debian's armhf glibc is newer and built for ARMv7.
+      # Needing a newer symbol means the binary was linked against the latter, and its startup code is
+      # a SIGILL on a Pi 1 / Zero. The CPU tags cannot tell: ring's NEON paths mark the file v7 anyway,
+      # and are only taken when the CPU has NEON. Better that the release goes without this target.
+      - name: Check the ARMv6 binary was linked against the ARMv6 sysroot
+        if: matrix.target == 'arm-unknown-linux-gnueabihf'
+        run: |
+          newest="$(readelf -V "target/${{ matrix.target }}/release/sonn-client" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "Newest glibc symbol needed: ${newest}"
+          if [ "$(printf '%s\n' "${newest}" GLIBC_2.17 | sort -V | tail -1)" != GLIBC_2.17 ]; then
+            echo "::error::arm-unknown-linux-gnueabihf binary was linked against an ARMv7 glibc"
+            exit 1
+          fi
       - name: Package
         run: |
           version="${{ needs.resolve.outputs.tag }}"
