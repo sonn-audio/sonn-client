@@ -40,11 +40,29 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 
+# GitHub answers 5xx and times out now and then; curl --retry backs off and tries again on those.
+fetch() {
+  curl -fsSL --retry 5 --retry-delay 2 "$@"
+}
+
+# The release page redirect carries the tag and is not rate-limited; the API is, at 60 unauthenticated
+# calls an hour per address, which a houseful of speakers behind one NAT reaches. Try the page first
+# and fall back to the API. Neither failing is caught by set -e: an empty answer is handled below.
+latest_tag() {
+  local tag
+  tag="$(fetch -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null |
+    sed -n 's#.*/releases/tag/\([^/?]*\).*#\1#p')" || true
+  if [ -z "$tag" ]; then
+    tag="$(fetch "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null |
+      sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)" || true
+  fi
+  printf '%s' "$tag"
+}
+
 if [ "$VERSION" = "latest" ]; then
   echo "Resolving latest release of ${REPO}..."
-  VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" |
-    sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)"
-  [ -n "$VERSION" ] || die "could not resolve the latest release tag; set SONN_CLIENT_VERSION=vX.Y.Z"
+  VERSION="$(latest_tag)"
+  [ -n "$VERSION" ] || die "could not resolve the latest release of ${REPO}: GitHub did not answer (check https://www.githubstatus.com). Retry later, or pick a release from https://github.com/${REPO}/releases and run again with SONN_CLIENT_VERSION=vX.Y.Z"
 fi
 VERSION="${VERSION#v}"
 
@@ -55,7 +73,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading ${ASSET}..."
-curl -fsSL "$URL" -o "${TMP}/${ASSET}" || die "download failed: ${URL}"
+fetch "$URL" -o "${TMP}/${ASSET}" || die "download failed: ${URL}"
 tar -xzf "${TMP}/${ASSET}" -C "$TMP"
 [ -f "${TMP}/${BIN_NAME}" ] || die "archive did not contain ${BIN_NAME}"
 
