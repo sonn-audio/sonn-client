@@ -40,9 +40,12 @@ case "$(uname -m)" in
   *) die "unsupported architecture: $(uname -m)" ;;
 esac
 
-# GitHub answers 5xx and times out now and then; curl --retry backs off and tries again on those.
+# GitHub answers 5xx and times out now and then, and when it is in trouble it accepts the connection
+# and then never answers. curl --retry tries again on the former; the connect timeout and the per-call
+# limits the callers pass bound the latter, so the script always ends, with a message, instead of
+# hanging in a stalled transfer forever.
 fetch() {
-  curl -fsSL --retry 5 --retry-delay 2 "$@"
+  curl -fsSL --connect-timeout 10 --retry 2 --retry-delay 2 "$@"
 }
 
 # The release page redirect carries the tag and is not rate-limited; the API is, at 60 unauthenticated
@@ -50,10 +53,10 @@ fetch() {
 # and fall back to the API. Neither failing is caught by set -e: an empty answer is handled below.
 latest_tag() {
   local tag
-  tag="$(fetch -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null |
+  tag="$(fetch --max-time 10 -o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" 2>/dev/null |
     sed -n 's#.*/releases/tag/\([^/?]*\).*#\1#p')" || true
   if [ -z "$tag" ]; then
-    tag="$(fetch "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null |
+    tag="$(fetch --max-time 10 "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null |
       sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1)" || true
   fi
   printf '%s' "$tag"
@@ -73,7 +76,9 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 echo "Downloading ${ASSET}..."
-fetch "$URL" -o "${TMP}/${ASSET}" || die "download failed: ${URL}"
+# No fixed limit on the download, the binary is a few MB and links differ; a transfer that stays under
+# 1 KB/s for 30 seconds is a stalled one and gets retried.
+fetch --speed-limit 1024 --speed-time 30 "$URL" -o "${TMP}/${ASSET}" || die "download failed: ${URL}"
 tar -xzf "${TMP}/${ASSET}" -C "$TMP"
 [ -f "${TMP}/${BIN_NAME}" ] || die "archive did not contain ${BIN_NAME}"
 
